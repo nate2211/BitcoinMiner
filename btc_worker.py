@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import collections
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from btc_models import BtcMinerConfig, BtcStratumJob, PreparedWork
@@ -10,6 +12,53 @@ from btc_opencl_scanner import OpenCLSha256dScanner
 from btc_reference_scanner import CpuExactSha256dScanner
 from btc_stratum_connection import BitcoinStratumConnection
 from btc_utils import build_header80, dbl_sha256, hash_meets_target, hash_to_display_hex, prepare_work
+
+
+@dataclass
+class _StatsSnapshot:
+    accepted: int = 0
+    rejected: int = 0
+    errors: int = 0
+    verify_failed: int = 0
+    stale_skipped: int = 0
+
+
+class _HashrateTracker:
+    def __init__(self, window_s: float) -> None:
+        self.window_s = max(1.0, float(window_s))
+        self.samples: collections.deque[tuple[float, int]] = collections.deque()
+        self.total_nonces = 0
+
+    def add(self, nonce_count: int) -> None:
+        now = time.time()
+        c = max(0, int(nonce_count))
+        self.samples.append((now, c))
+        self.total_nonces += c
+        self._trim(now)
+
+    def rate_hs(self) -> float:
+        now = time.time()
+        self._trim(now)
+        if not self.samples:
+            return 0.0
+        total = sum(v for _, v in self.samples)
+        dt = max(0.001, now - self.samples[0][0])
+        return total / dt
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self.window_s
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+
+def _format_hashrate(hs: float) -> str:
+    units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s"]
+    value = float(hs)
+    idx = 0
+    while value >= 1000.0 and idx < len(units) - 1:
+        value /= 1000.0
+        idx += 1
+    return f"{value:.2f} {units[idx]}"
 
 
 class BitcoinMinerWorker:
@@ -30,7 +79,10 @@ class BitcoinMinerWorker:
         self._prepared_work: Optional[PreparedWork] = None
         self._nonce_cursor: int = 0
         self._extranonce2_counter: int = 0
-        self._last_job_at: float = 0.0
+
+        self._stats = _StatsSnapshot()
+        self._hashrate = _HashrateTracker(window_s=float(self.config.stats_window_s))
+        self._last_stats_log_at = 0.0
 
         self.native = BitcoinNativeBridge(self.config.native_dll_path, self.on_log)
 
@@ -39,6 +91,7 @@ class BitcoinMinerWorker:
             on_log=self.on_log,
             on_job=self._on_job,
             on_status=self.on_status,
+            on_session_update=self._on_session_update,
         )
 
         self.scanner = self._make_scanner()
@@ -72,106 +125,163 @@ class BitcoinMinerWorker:
         self._stop.set()
 
     def run(self) -> None:
-        self.client.connect()
+        backoff = max(0.25, float(self.config.reconnect_initial_delay_s))
+        next_host = self.config.host
+        next_port = int(self.config.port)
 
         try:
             while not self._stop.is_set():
-                if not self.client.alive:
-                    raise RuntimeError(f"stratum connection lost: {self.client.fatal_error or 'disconnected'}")
-
-                now = time.time()
-                if self._last_job_at > 0 and (now - self._last_job_at) > 120:
-                    raise RuntimeError("no mining.notify received for 120 seconds")
-
-                job, work = self._get_job_and_work()
-
-                if job is None:
-                    time.sleep(float(self.config.idle_sleep_s))
-                    continue
-
-                if work is None:
-                    work = self._prepare_next_work(job)
-
-                count = max(1, int(self.config.scan_window_nonces))
-                max_results = max(1, int(self.config.max_results_per_scan))
-
-                with self._job_lock:
-                    start_nonce = self._nonce_cursor
-                    if start_nonce + count >= 0x100000000:
+                try:
+                    self.client.connect(host_override=next_host, port_override=next_port)
+                    self.on_status("running")
+                    self._session_loop()
+                    backoff = max(0.25, float(self.config.reconnect_initial_delay_s))
+                except Exception as exc:
+                    if self._stop.is_set():
+                        break
+                    self.on_log(f"[worker] session error: {exc}")
+                finally:
+                    try:
+                        self.client.close()
+                    except Exception:
+                        pass
+                    with self._job_lock:
+                        self._current_job = None
                         self._prepared_work = None
                         self._nonce_cursor = 0
-                        self.on_log(f"[worker] nonce space exhausted for job={job.job_id}; rolling extranonce2")
-                        continue
-                    self._nonce_cursor += count
 
-                self.on_log(
-                    f"[scan] job={job.job_id} extranonce2={work.extranonce2_hex} "
-                    f"start_nonce={start_nonce:08x} count={count}"
-                )
+                if self._stop.is_set():
+                    break
 
-                found = self.scanner.scan(
-                    work=work,
-                    start_nonce=start_nonce,
-                    count=count,
-                    max_results=max_results,
-                )
+                requested = self.client.consume_reconnect_request()
+                if requested is not None:
+                    next_host, next_port, wait_s = requested
+                    sleep_s = max(0.0, float(wait_s))
+                    self.on_log(
+                        f"[worker] reconnect requested host={next_host} port={next_port} wait={sleep_s:.1f}s"
+                    )
+                    backoff = max(0.25, float(self.config.reconnect_initial_delay_s))
+                else:
+                    next_host = self.config.host
+                    next_port = int(self.config.port)
+                    sleep_s = backoff
+                    backoff = min(float(self.config.reconnect_max_delay_s), max(backoff * 2.0, 1.0))
 
-                if not found:
-                    continue
-
-                for share in found:
-                    if self._is_stale_share(share.job_id):
-                        self.on_log(
-                            f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} reason=current job changed"
-                        )
-                        continue
-
-                    verified_hash_hex = self._verify_share_exact(work, share.nonce)
-                    if not verified_hash_hex:
-                        self.on_log(
-                            f"[submit] verify-failed job={share.job_id} nonce={share.nonce:08x} "
-                            f"reason=candidate did not meet target on exact recheck"
-                        )
-                        continue
-
-                    result = self.client.submit(share)
-                    if result.accepted:
-                        self.on_log(
-                            f"[submit] accepted job={share.job_id} "
-                            f"nonce={share.nonce:08x} hash={verified_hash_hex}"
-                        )
-                    else:
-                        self.on_log(
-                            f"[submit] rejected job={share.job_id} "
-                            f"nonce={share.nonce:08x} error={result.error or result.status}"
-                        )
-
+                self.on_status("reconnecting")
+                time.sleep(sleep_s)
         finally:
             try:
-                self.client.close()
-            finally:
-                try:
-                    self.scanner.close()
-                except Exception:
-                    pass
-                try:
-                    self.verifier.close()
-                except Exception:
-                    pass
+                self.scanner.close()
+            except Exception:
+                pass
+            try:
+                self.verifier.close()
+            except Exception:
+                pass
+
+    def _session_loop(self) -> None:
+        while not self._stop.is_set():
+            if not self.client.alive:
+                raise RuntimeError(f"stratum connection lost: {self.client.fatal_error or 'disconnected'}")
+
+            idle_reconnect_s = float(self.config.idle_reconnect_s)
+            if idle_reconnect_s > 0.0 and self.client.seconds_since_recv() > idle_reconnect_s:
+                raise RuntimeError(f"no stratum traffic for {idle_reconnect_s:.0f}s")
+
+            job, work = self._get_job_and_work()
+
+            if job is None:
+                self._maybe_log_stats()
+                time.sleep(float(self.config.idle_sleep_s))
+                continue
+
+            if work is None:
+                work = self._prepare_next_work(job)
+
+            count = max(1, int(self.config.scan_window_nonces))
+            max_results = max(1, int(self.config.max_results_per_scan))
+
+            with self._job_lock:
+                start_nonce = self._nonce_cursor
+                if start_nonce + count >= 0x100000000:
+                    self._prepared_work = None
+                    self._nonce_cursor = 0
+                    self.on_log(f"[worker] nonce space exhausted for job={job.job_id}; rolling extranonce2")
+                    continue
+                self._nonce_cursor += count
+
+            self.on_log(
+                f"[scan] job={job.job_id} extranonce2={work.extranonce2_hex} "
+                f"start_nonce={start_nonce:08x} count={count}"
+            )
+
+            scan_t0 = time.time()
+            found = self.scanner.scan(
+                work=work,
+                start_nonce=start_nonce,
+                count=count,
+                max_results=max_results,
+            )
+            scan_dt = max(0.000001, time.time() - scan_t0)
+            self._hashrate.add(count)
+            self._maybe_log_stats(inst_hs=(count / scan_dt))
+
+            if not found:
+                continue
+
+            for share in found:
+                if self._is_stale_share(share.job_id):
+                    self._stats.stale_skipped += 1
+                    self.on_log(
+                        f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} reason=current job changed"
+                    )
+                    continue
+
+                verified_hash_hex = self._verify_share_exact(work, share.nonce)
+                if not verified_hash_hex:
+                    self._stats.verify_failed += 1
+                    self.on_log(
+                        f"[submit] verify-failed job={share.job_id} nonce={share.nonce:08x} "
+                        f"reason=candidate did not meet target on exact recheck"
+                    )
+                    continue
+
+                result = self.client.submit(share)
+                if result.accepted:
+                    self._stats.accepted += 1
+                    self.on_log(
+                        f"[submit] accepted job={share.job_id} nonce={share.nonce:08x} hash={verified_hash_hex}"
+                    )
+                else:
+                    if result.status == "error":
+                        self._stats.errors += 1
+                    else:
+                        self._stats.rejected += 1
+                    self.on_log(
+                        f"[submit] rejected job={share.job_id} nonce={share.nonce:08x} "
+                        f"error={result.error or result.status}"
+                    )
 
     def _on_job(self, job: BtcStratumJob) -> None:
         with self._job_lock:
-            self._current_job = job
-            self._prepared_work = None
-            self._nonce_cursor = 0
-            self._last_job_at = time.time()
-
             if job.clean_jobs:
+                self._prepared_work = None
+                self._nonce_cursor = 0
                 self._extranonce2_counter = 0
+            self._current_job = job
 
         self.on_log(
             f"[worker] new_job job_id={job.job_id} clean={job.clean_jobs} target={job.share_target_hex}"
         )
+
+    def _on_session_update(self, reason: str) -> None:
+        # Any session change can invalidate prepared work.
+        with self._job_lock:
+            self._prepared_work = None
+            self._nonce_cursor = 0
+            if reason == "extranonce":
+                self._extranonce2_counter = 0
+        self.on_log(f"[worker] session_update reason={reason} work reset")
 
     def _get_job_and_work(self) -> tuple[Optional[BtcStratumJob], Optional[PreparedWork]]:
         with self._job_lock:
@@ -223,3 +333,25 @@ class BitcoinMinerWorker:
             return ""
 
         return hash_to_display_hex(raw_hash)
+
+    def _maybe_log_stats(self, inst_hs: Optional[float] = None) -> None:
+        now = time.time()
+        every = max(1.0, float(self.config.stats_log_interval_s))
+        if (now - self._last_stats_log_at) < every:
+            return
+        self._last_stats_log_at = now
+
+        avg_hs = self._hashrate.rate_hs()
+        inst_text = _format_hashrate(inst_hs if inst_hs is not None else avg_hs)
+        avg_text = _format_hashrate(avg_hs)
+
+        self.on_log(
+            "[stats] "
+            f"inst={inst_text} "
+            f"avg{int(self.config.stats_window_s)}={avg_text} "
+            f"accepted={self._stats.accepted} "
+            f"rejected={self._stats.rejected} "
+            f"errors={self._stats.errors} "
+            f"verify_failed={self._stats.verify_failed} "
+            f"stale={self._stats.stale_skipped}"
+        )

@@ -26,12 +26,23 @@ def reverse_hex_bytes(text: str) -> bytes:
     return hex_to_bytes(text)[::-1]
 
 
+def swap_endian_words_bytes(text: str) -> bytes:
+    raw = hex_to_bytes(text)
+    if len(raw) % 4 != 0:
+        raise ValueError("word-swapped hex must be 4-byte aligned")
+    return b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+
+
 def u32_to_le_bytes(value: int) -> bytes:
     return int(value & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
 
 
 def u32_to_submit_hex(value: int) -> str:
-    return f"{int(value) & 0xFFFFFFFF:08x}"
+    """
+    Submit the 4 raw header nonce bytes as hex, matching the bytes placed
+    into the 80-byte header.
+    """
+    return u32_to_le_bytes(value).hex()
 
 
 def dbl_sha256(data: bytes) -> bytes:
@@ -56,8 +67,7 @@ def target_int_to_bytes_be(target: int) -> bytes:
 
 def hash_meets_target(hash_bytes_raw: bytes, target_int: int) -> bool:
     """
-    Bitcoin compares the 32-byte hash as a little-endian integer against the target.
-    hashlib's digest bytes should therefore be interpreted as little-endian here.
+    Bitcoin compares the 32-byte digest as a little-endian integer to the target.
     """
     if len(hash_bytes_raw) != 32:
         return False
@@ -66,7 +76,7 @@ def hash_meets_target(hash_bytes_raw: bytes, target_int: int) -> bool:
 
 def hash_to_display_hex(hash_bytes_raw: bytes) -> str:
     """
-    Display block/share hash in the standard human-facing big-endian hex form.
+    Human-facing big-endian hex display.
     """
     if len(hash_bytes_raw) != 32:
         return hash_bytes_raw.hex()
@@ -105,7 +115,8 @@ def build_header_prefix76(
         raise ValueError("merkle_root_raw must be 32 bytes")
 
     version_le = reverse_hex_bytes(version_hex)
-    prevhash_le = reverse_hex_bytes(prevhash_hex)
+    prevhash_le = swap_endian_words_bytes(prevhash_hex)
+    merkle_root_le = merkle_root_raw[::-1]
     ntime_le = reverse_hex_bytes(ntime_hex)
     nbits_le = reverse_hex_bytes(nbits_hex)
 
@@ -118,8 +129,7 @@ def build_header_prefix76(
     if len(nbits_le) != 4:
         raise ValueError(f"nbits_hex must be 4 bytes, got {nbits_hex!r}")
 
-    # merkle_root_raw from dbl_sha256 folding is already the raw 32 bytes to place in the header.
-    return version_le + prevhash_le + merkle_root_raw + ntime_le + nbits_le
+    return version_le + prevhash_le + merkle_root_le + ntime_le + nbits_le
 
 
 def build_header80(header_prefix76: bytes, nonce: int) -> bytes:

@@ -12,11 +12,11 @@ class BtcMinerConfig:
     port: int = 4444
     login: str = "bc1qp55qrhrrqt47d62w6x3me4alx70gqqsgkaew00.worker"
     password: str = "x"
-    agent: str = "OpenCL-BTC/0.2"
+    agent: str = "OpenCL-BTC/0.4"
     use_tls: bool = False
 
-    socket_timeout_s: float = 60.0
-    submit_timeout_s: float = 15.0
+    socket_timeout_s: float = 30.0
+    submit_timeout_s: float = 10.0
 
     # Scanner backend: "opencl" | "native" | "python" | "auto"
     scan_backend: str = "opencl"
@@ -33,9 +33,24 @@ class BtcMinerConfig:
     local_work_size: Optional[int] = 128
 
     # Mining loop
-    scan_window_nonces: int = 1_048_576
+    scan_window_nonces: int = 262_144
     max_results_per_scan: int = 8
-    idle_sleep_s: float = 0.10
+    idle_sleep_s: float = 0.02
+
+    # Reconnect / liveness
+    reconnect_initial_delay_s: float = 1.0
+    reconnect_max_delay_s: float = 30.0
+    idle_reconnect_s: float = 180.0
+
+    # TCP keepalive
+    tcp_keepalive: bool = True
+    tcp_keepidle_s: int = 60
+    tcp_keepintvl_s: int = 15
+    tcp_keepcnt: int = 4
+
+    # Stats
+    stats_log_interval_s: float = 5.0
+    stats_window_s: float = 30.0
 
     def normalized_scan_backend(self) -> str:
         text = (self.scan_backend or "opencl").strip().lower()
@@ -50,6 +65,7 @@ class StratumSession:
     extranonce2_size: int = 0
     subscribed: bool = False
     authorized: bool = False
+    version_mask: str = ""
 
 
 @dataclass

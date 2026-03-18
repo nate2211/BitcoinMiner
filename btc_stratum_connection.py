@@ -5,6 +5,7 @@ import queue
 import socket
 import ssl
 import threading
+import time
 from typing import Callable, Optional
 
 from btc_models import BtcMinerConfig, BtcStratumJob, CandidateShare, StratumSession, SubmitResult
@@ -18,11 +19,13 @@ class BitcoinStratumConnection:
         on_log: Callable[[str], None],
         on_job: Callable[[BtcStratumJob], None],
         on_status: Callable[[str], None],
+        on_session_update: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config
         self.on_log = on_log
         self.on_job = on_job
         self.on_status = on_status
+        self.on_session_update = on_session_update or (lambda reason: None)
 
         self.session = StratumSession()
 
@@ -39,6 +42,12 @@ class BitcoinStratumConnection:
         self._recv_buffer = b""
         self._alive = False
         self._fatal_error: str = ""
+        self._last_recv_at: float = 0.0
+
+        self._current_host = config.host
+        self._current_port = int(config.port)
+        self._requested_reconnect: Optional[tuple[str, int, float]] = None
+        self._closing_for_reconnect = False
 
     @property
     def alive(self) -> bool:
@@ -48,33 +57,44 @@ class BitcoinStratumConnection:
     def fatal_error(self) -> str:
         return self._fatal_error
 
-    def connect(self) -> None:
+    def seconds_since_recv(self) -> float:
+        if self._last_recv_at <= 0.0:
+            return 0.0
+        return max(0.0, time.time() - self._last_recv_at)
+
+    def consume_reconnect_request(self) -> Optional[tuple[str, int, float]]:
+        req = self._requested_reconnect
+        self._requested_reconnect = None
+        return req
+
+    def connect(self, host_override: Optional[str] = None, port_override: Optional[int] = None) -> None:
         self._stop.clear()
         self._recv_buffer = b""
         self._fatal_error = ""
         self._alive = False
+        self._last_recv_at = 0.0
+        self._requested_reconnect = None
+        self._closing_for_reconnect = False
+
+        self.session = StratumSession()
+
+        self._current_host = (host_override or self.config.host).strip()
+        self._current_port = int(port_override or self.config.port)
 
         raw = socket.create_connection(
-            (self.config.host, self.config.port),
+            (self._current_host, self._current_port),
             timeout=float(self.config.socket_timeout_s),
         )
-
-        try:
-            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
+        self._configure_socket(raw)
 
         if self.config.use_tls:
             ctx = ssl.create_default_context()
-            raw = ctx.wrap_socket(raw, server_hostname=self.config.host)
+            raw = ctx.wrap_socket(raw, server_hostname=self._current_host)
 
-        # IMPORTANT:
-        # do not use makefile()+readline() on a timed socket here.
-        # Use raw recv() and line buffering ourselves.
         raw.settimeout(None)
-
         self._sock = raw
         self._alive = True
+        self._last_recv_at = time.time()
 
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
@@ -85,10 +105,11 @@ class BitcoinStratumConnection:
 
         self.on_status("connecting")
         self.on_log(
-            f"[stratum] connected host={self.config.host} port={self.config.port} tls={self.config.use_tls}"
+            f"[stratum] connected host={self._current_host} port={self._current_port} tls={self.config.use_tls}"
         )
 
         try:
+            # Some servers return True here, some do not support it at all.
             self._rpc("mining.extranonce.subscribe", [], timeout=5.0)
         except Exception:
             pass
@@ -110,23 +131,28 @@ class BitcoinStratumConnection:
         self._stop.set()
         self._alive = False
 
+        sock = self._sock
+        self._sock = None
+
         try:
-            if self._sock is not None:
+            if sock is not None:
                 try:
-                    self._sock.shutdown(socket.SHUT_RDWR)
+                    sock.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
-                self._sock.close()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        if self._reader_thread is not None:
+        if self._reader_thread is not None and threading.current_thread() is not self._reader_thread:
             try:
                 self._reader_thread.join(timeout=2.0)
             except Exception:
                 pass
 
-        self._sock = None
         self._reader_thread = None
         self.on_status("closed")
 
@@ -159,8 +185,54 @@ class BitcoinStratumConnection:
                 raw=None,
             )
 
+    def _configure_socket(self, raw: socket.socket) -> None:
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+        if not bool(self.config.tcp_keepalive):
+            return
+
+        try:
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            try:
+                raw.ioctl(
+                    socket.SIO_KEEPALIVE_VALS,
+                    (
+                        1,
+                        int(self.config.tcp_keepidle_s * 1000),
+                        int(self.config.tcp_keepintvl_s * 1000),
+                    ),
+                )
+            except Exception:
+                pass
+            return
+
+        for name, value in (
+            ("TCP_KEEPIDLE", int(self.config.tcp_keepidle_s)),
+            ("TCP_KEEPINTVL", int(self.config.tcp_keepintvl_s)),
+            ("TCP_KEEPCNT", int(self.config.tcp_keepcnt)),
+        ):
+            try:
+                opt = getattr(socket, name)
+                raw.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except Exception:
+                pass
+
     def _handle_subscribe_result(self, msg: dict) -> None:
         result = msg.get("result")
+
+        if isinstance(result, bool):
+            raise RuntimeError(
+                "This server did not return a Bitcoin Stratum subscribe tuple. "
+                "It is likely not a Bitcoin Stratum v1 pool for this client."
+            )
+
         if not isinstance(result, list) or len(result) < 3:
             raise RuntimeError(f"unexpected subscribe result: {msg!r}")
 
@@ -170,6 +242,7 @@ class BitcoinStratumConnection:
         self.session.extranonce1_hex = extranonce1
         self.session.extranonce2_size = extranonce2_size
         self.session.subscribed = True
+        self.on_session_update("subscribe")
 
         self.on_log(
             f"[stratum] subscribed extranonce1={extranonce1} extranonce2_size={extranonce2_size}"
@@ -194,24 +267,59 @@ class BitcoinStratumConnection:
 
     def _send_json(self, payload: dict) -> None:
         raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-        if self._sock is None:
+        sock = self._sock
+        if sock is None:
             raise RuntimeError("socket is not connected")
         with self._send_lock:
-            self._sock.sendall(raw)
+            sock.sendall(raw)
+
+    def _send_result(self, msg_id, result=None, error=None) -> None:
+        if msg_id is None:
+            return
+        try:
+            self._send_json({"id": msg_id, "result": result, "error": error})
+        except Exception:
+            pass
+
+    def _schedule_reconnect(self, host: Optional[str], port: Optional[int], wait_s: float, reason: str) -> None:
+        target_host = (host or self._current_host or self.config.host).strip()
+        target_port = int(port or self._current_port or self.config.port)
+        self._requested_reconnect = (target_host, target_port, max(0.0, float(wait_s)))
+        self._closing_for_reconnect = True
+        self._alive = False
+        self._fatal_error = reason
+
+        sock = self._sock
+        self._sock = None
+
+        try:
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                if self._sock is None:
+                sock = self._sock
+                if sock is None:
                     break
 
-                chunk = self._sock.recv(4096)
+                chunk = sock.recv(4096)
                 if not chunk:
                     self._alive = False
-                    if not self._stop.is_set():
+                    if not self._stop.is_set() and not self._closing_for_reconnect:
                         self.on_status("disconnected")
                     break
 
+                self._last_recv_at = time.time()
                 self._recv_buffer += chunk
 
                 while b"\n" in self._recv_buffer:
@@ -228,12 +336,23 @@ class BitcoinStratumConnection:
 
                     self._handle_message(msg)
 
+            except OSError as exc:
+                self._alive = False
+                if self._stop.is_set() or self._closing_for_reconnect:
+                    break
+                if getattr(exc, "winerror", None) == 10038:
+                    break
+                self._fatal_error = str(exc)
+                self.on_log(f"[stratum] reader error: {exc}")
+                self.on_status("error")
+                break
             except Exception as exc:
                 self._alive = False
+                if self._stop.is_set() or self._closing_for_reconnect:
+                    break
                 self._fatal_error = str(exc)
-                if not self._stop.is_set():
-                    self.on_log(f"[stratum] reader error: {exc}")
-                    self.on_status("error")
+                self.on_log(f"[stratum] reader error: {exc}")
+                self.on_status("error")
                 break
 
     def _handle_message(self, msg: dict) -> None:
@@ -262,9 +381,27 @@ class BitcoinStratumConnection:
         method = str(msg.get("method") or "")
         params = msg.get("params") or []
 
+        if method == "client.get_version":
+            self._send_result(msg.get("id"), self.config.agent, None)
+            return
+
+        if method == "client.show_message":
+            text = str(params[0] or "") if params else ""
+            self.on_log(f"[stratum] server-message {text}")
+            return
+
+        if method == "client.reconnect":
+            host = str(params[0]).strip() if len(params) >= 1 and params[0] else self._current_host
+            port = int(params[1]) if len(params) >= 2 and params[1] else self._current_port
+            wait_s = float(params[2]) if len(params) >= 3 and params[2] is not None else 0.0
+            self.on_log(f"[stratum] server requested reconnect host={host} port={port} wait={wait_s}")
+            self._schedule_reconnect(host, port, wait_s, "server requested reconnect")
+            return
+
         if method == "mining.set_difficulty":
             if params:
                 self._share_difficulty = float(params[0])
+                self.on_session_update("difficulty")
                 self.on_log(f"[stratum] set_difficulty={self._share_difficulty}")
             return
 
@@ -272,10 +409,17 @@ class BitcoinStratumConnection:
             if len(params) >= 2:
                 self.session.extranonce1_hex = str(params[0] or "")
                 self.session.extranonce2_size = int(params[1])
+                self.on_session_update("extranonce")
                 self.on_log(
                     f"[stratum] set_extranonce extranonce1={self.session.extranonce1_hex} "
                     f"extranonce2_size={self.session.extranonce2_size}"
                 )
+            return
+
+        if method == "mining.set_version_mask":
+            if params:
+                self.session.version_mask = str(params[0] or "")
+                self.on_log(f"[stratum] set_version_mask params={params!r}")
             return
 
         if method == "mining.notify":
