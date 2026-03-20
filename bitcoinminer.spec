@@ -18,6 +18,10 @@ kernel_path = ROOT / "btc_sha256d_scan.cl"
 if kernel_path.exists():
     datas.append((str(kernel_path), "."))
 
+config_path = ROOT / "bitcoin_gui_config.json"
+if config_path.exists():
+    datas.append((str(config_path), "."))
+
 for dll_name in ("BitcoinProject.dll", "OpenCL.dll"):
     dll_path = ROOT / dll_name
     if dll_path.exists():
