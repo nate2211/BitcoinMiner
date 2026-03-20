@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -19,10 +21,55 @@ class OpenCLDeviceInfo:
     device_name: str
 
 
-def _resolve_path(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-    return os.path.abspath(path)
+def _runtime_base_dir() -> Path:
+    """
+    Returns the directory that should be treated as the app base:
+    - PyInstaller one-file/one-dir bundle: sys._MEIPASS
+    - normal Python execution: directory of this file
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _candidate_paths(path: str) -> list[Path]:
+    """
+    Build a list of possible locations for a resource.
+    """
+    p = Path(path)
+    bases = [
+        Path.cwd(),
+        _runtime_base_dir(),
+        Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent,
+    ]
+
+    candidates: list[Path] = []
+
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        for base in bases:
+            candidates.append((base / p).resolve())
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        s = str(c)
+        if s not in seen:
+            seen.add(s)
+            unique.append(c)
+    return unique
+
+
+def _resolve_existing_path(path: str) -> str:
+    for candidate in _candidate_paths(path):
+        if candidate.exists():
+            return str(candidate)
+    # fall back to the most likely runtime path
+    return str(_candidate_paths(path)[0])
 
 
 class OpenCLSha256dScanner:
@@ -138,70 +185,78 @@ class OpenCLSha256dScanner:
         prefix_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prefix_np)
         target_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=target_np)
 
-        lws = self._launch_local_size(count)
-        if lws is None:
-            global_work = (count,)
-            local_work = None
-        else:
-            rounded = ((count + lws - 1) // lws) * lws
-            global_work = (rounded,)
-            local_work = (lws,)
+        try:
+            lws = self._launch_local_size(count)
+            if lws is None:
+                global_work = (count,)
+                local_work = None
+            else:
+                rounded = ((count + lws - 1) // lws) * lws
+                global_work = (rounded,)
+                local_work = (lws,)
 
-        evt = self.kernel(
-            self.queue,
-            global_work,
-            local_work,
-            prefix_buf,
-            np.uint32(count),
-            np.uint32(start_nonce & 0xFFFFFFFF),
-            target_buf,
-            np.uint32(max_results),
-            self._out_nonces_buf,
-            self._out_hashes_buf,
-            self._out_count_buf,
-        )
-        evt.wait()
+            evt = self.kernel(
+                self.queue,
+                global_work,
+                local_work,
+                prefix_buf,
+                np.uint32(count),
+                np.uint32(start_nonce & 0xFFFFFFFF),
+                target_buf,
+                np.uint32(max_results),
+                self._out_nonces_buf,
+                self._out_hashes_buf,
+                self._out_count_buf,
+            )
+            evt.wait()
 
-        cl.enqueue_copy(self.queue, self._out_count_np, self._out_count_buf).wait()
-        found = min(int(self._out_count_np[0]), max_results)
+            cl.enqueue_copy(self.queue, self._out_count_np, self._out_count_buf).wait()
+            found = min(int(self._out_count_np[0]), max_results)
 
-        results: list[CandidateShare] = []
-        if found > 0:
-            cl.enqueue_copy(self.queue, self._out_nonces_np[:found], self._out_nonces_buf).wait()
-            cl.enqueue_copy(self.queue, self._out_hashes_np[:found, :], self._out_hashes_buf).wait()
+            results: list[CandidateShare] = []
+            if found > 0:
+                cl.enqueue_copy(self.queue, self._out_nonces_np[:found], self._out_nonces_buf).wait()
+                cl.enqueue_copy(self.queue, self._out_hashes_np[:found, :], self._out_hashes_buf).wait()
 
-            for i in range(found):
-                results.append(
-                    CandidateShare(
-                        job_id=work.job_id,
-                        extranonce2_hex=work.extranonce2_hex,
-                        ntime_hex=work.ntime_hex,
-                        nonce=int(self._out_nonces_np[i]),
-                        header_hash_hex=bytes(self._out_hashes_np[i]).hex(),
+                for i in range(found):
+                    results.append(
+                        CandidateShare(
+                            job_id=work.job_id,
+                            extranonce2_hex=work.extranonce2_hex,
+                            ntime_hex=work.ntime_hex,
+                            nonce=int(self._out_nonces_np[i]),
+                            header_hash_hex=bytes(self._out_hashes_np[i]).hex(),
+                        )
                     )
-                )
-
-        try:
-            prefix_buf.release()
-        except Exception:
-            pass
-        try:
-            target_buf.release()
-        except Exception:
-            pass
-
-        return results
+            return results
+        finally:
+            try:
+                prefix_buf.release()
+            except Exception:
+                pass
+            try:
+                target_buf.release()
+            except Exception:
+                pass
 
     def _ensure_opencl_loader(self) -> None:
-        loader = _resolve_path(self.config.opencl_loader)
+        loader = _resolve_existing_path(self.config.opencl_loader)
         if os.name == "nt":
             ctypes.WinDLL(loader)
             self.on_log(f"[opencl] loaded {loader}")
 
     def _build_program(self, ctx: cl.Context, kernel_path: str, build_options: str) -> cl.Program:
-        resolved = _resolve_path(kernel_path)
+        resolved = _resolve_existing_path(kernel_path)
+        self.on_log(f"[opencl] requested kernel_path={kernel_path}")
+        self.on_log(f"[opencl] resolved kernel_path={resolved}")
+
         if not os.path.exists(resolved):
-            raise FileNotFoundError(f"OpenCL kernel not found: {resolved}")
+            searched = "\n".join(f" - {p}" for p in _candidate_paths(kernel_path))
+            raise FileNotFoundError(
+                f"OpenCL kernel not found.\n"
+                f"requested: {kernel_path}\n"
+                f"searched:\n{searched}"
+            )
 
         with open(resolved, "r", encoding="utf-8", errors="replace") as f:
             src = f.read()
