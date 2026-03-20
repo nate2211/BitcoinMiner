@@ -20,7 +20,7 @@ __constant uint K[64] = {
 };
 
 inline uint rotr32(uint x, uint n) {
-    return (x >> n) | (x << (32u - n));
+    return rotate(x, 32u - n);
 }
 
 inline uint ch32(uint x, uint y, uint z) {
@@ -47,91 +47,93 @@ inline uint ssig1(uint x) {
     return rotr32(x, 17u) ^ rotr32(x, 19u) ^ (x >> 10u);
 }
 
-inline uint read_be32_private(__private const uchar* p) {
-    return ((uint)p[0] << 24) | ((uint)p[1] << 16) | ((uint)p[2] << 8) | (uint)p[3];
+inline uint read_be32_global(__global const uchar* p) {
+    return ((uint)p[0] << 24) |
+           ((uint)p[1] << 16) |
+           ((uint)p[2] << 8)  |
+           (uint)p[3];
 }
 
-inline void write_be32_private(__private uchar* p, uint v) {
-    p[0] = (uchar)((v >> 24) & 0xffu);
-    p[1] = (uchar)((v >> 16) & 0xffu);
-    p[2] = (uchar)((v >> 8) & 0xffu);
-    p[3] = (uchar)(v & 0xffu);
+inline void write_le32_global(__global uchar* p, uint v) {
+    p[0] = (uchar)(v & 0xffu);
+    p[1] = (uchar)((v >> 8) & 0xffu);
+    p[2] = (uchar)((v >> 16) & 0xffu);
+    p[3] = (uchar)((v >> 24) & 0xffu);
 }
 
-inline void sha256_bytes_private(__private const uchar* data, uint len, __private uchar out[32]) {
-    uint H[8] = {
-        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
-    };
+inline uint bswap32(uint x) {
+    return ((x & 0x000000ffu) << 24) |
+           ((x & 0x0000ff00u) << 8)  |
+           ((x & 0x00ff0000u) >> 8)  |
+           ((x & 0xff000000u) >> 24);
+}
 
-    __private uchar msg[128];
-    for (uint i = 0u; i < 128u; ++i) {
-        msg[i] = (uchar)0;
+inline void sha256_init(__private uint s[8]) {
+    s[0] = 0x6a09e667u;
+    s[1] = 0xbb67ae85u;
+    s[2] = 0x3c6ef372u;
+    s[3] = 0xa54ff53au;
+    s[4] = 0x510e527fu;
+    s[5] = 0x9b05688cu;
+    s[6] = 0x1f83d9abu;
+    s[7] = 0x5be0cd19u;
+}
+
+inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
+    uint a = state[0];
+    uint b = state[1];
+    uint c = state[2];
+    uint d = state[3];
+    uint e = state[4];
+    uint f = state[5];
+    uint g = state[6];
+    uint h = state[7];
+
+    #pragma unroll
+    for (uint i = 0u; i < 64u; ++i) {
+        uint wi;
+        if (i < 16u) {
+            wi = w[i];
+        } else {
+            wi = w[i & 15u]
+               + ssig0(w[(i + 1u) & 15u])
+               + w[(i + 9u) & 15u]
+               + ssig1(w[(i + 14u) & 15u]);
+            w[i & 15u] = wi;
+        }
+
+        uint t1 = h + bsig1(e) + ch32(e, f, g) + K[i] + wi;
+        uint t2 = bsig0(a) + maj32(a, b, c);
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
     }
 
-    for (uint i = 0u; i < len; ++i) {
-        msg[i] = data[i];
-    }
-    msg[len] = (uchar)0x80;
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
 
-    ulong bit_len = ((ulong)len) * 8UL;
-    uint total = (len + 9u <= 64u) ? 64u : 128u;
+inline int hash_meets_target_be_words(
+    __private const uint hash_be_words[8],
+    __local const uint* target_be_words
+) {
     for (uint i = 0u; i < 8u; ++i) {
-        msg[total - 1u - i] = (uchar)((bit_len >> (8u * i)) & 0xffUL);
-    }
-
-    for (uint chunk = 0u; chunk < total; chunk += 64u) {
-        uint w[64];
-        for (uint i = 0u; i < 16u; ++i) {
-            w[i] = read_be32_private(&msg[chunk + (i * 4u)]);
-        }
-        for (uint i = 16u; i < 64u; ++i) {
-            w[i] = ssig1(w[i - 2u]) + w[i - 7u] + ssig0(w[i - 15u]) + w[i - 16u];
-        }
-
-        uint a = H[0];
-        uint b = H[1];
-        uint c = H[2];
-        uint d = H[3];
-        uint e = H[4];
-        uint f = H[5];
-        uint g = H[6];
-        uint h = H[7];
-
-        for (uint i = 0u; i < 64u; ++i) {
-            uint t1 = h + bsig1(e) + ch32(e, f, g) + K[i] + w[i];
-            uint t2 = bsig0(a) + maj32(a, b, c);
-            h = g;
-            g = f;
-            f = e;
-            e = d + t1;
-            d = c;
-            c = b;
-            b = a;
-            a = t1 + t2;
-        }
-
-        H[0] += a;
-        H[1] += b;
-        H[2] += c;
-        H[3] += d;
-        H[4] += e;
-        H[5] += f;
-        H[6] += g;
-        H[7] += h;
-    }
-
-    for (uint i = 0u; i < 8u; ++i) {
-        write_be32_private(&out[i * 4u], H[i]);
-    }
-}
-
-inline int hash_meets_target_be(__private const uchar hash_raw[32], __global const uchar* target_be) {
-    for (uint i = 0u; i < 32u; ++i) {
-        uchar hb = hash_raw[31u - i];
-        uchar tb = target_be[i];
-        if (hb < tb) return 1;
-        if (hb > tb) return 0;
+        uint hv = hash_be_words[i];
+        uint tv = target_be_words[i];
+        if (hv < tv) return 1;
+        if (hv > tv) return 0;
     }
     return 1;
 }
@@ -146,29 +148,105 @@ __kernel void btc_sha256d_scan(
     __global uchar* out_hashes32_be,
     __global uint* out_count
 ) {
-    uint gid = (uint)get_global_id(0);
+    const uint gid = (uint)get_global_id(0);
+    const uint lid = (uint)get_local_id(0);
+
+    __local uint l_midstate[8];
+    __local uint l_tail[3];
+    __local uint l_target[8];
+
+    if (lid == 0u) {
+        uint s[8];
+        uint w[16];
+
+        sha256_init(s);
+
+        // header_prefix76[0..63]
+        #pragma unroll
+        for (uint i = 0u; i < 16u; ++i) {
+            w[i] = read_be32_global(header_prefix76 + (i * 4u));
+        }
+        sha256_compress_16w(s, w);
+
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            l_midstate[i] = s[i];
+        }
+
+        // header_prefix76[64..75]
+        l_tail[0] = read_be32_global(header_prefix76 + 64u);
+        l_tail[1] = read_be32_global(header_prefix76 + 68u);
+        l_tail[2] = read_be32_global(header_prefix76 + 72u);
+
+        // target32_be as 8 big-endian words
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            l_target[i] = read_be32_global(target32_be + (i * 4u));
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     if (gid >= nonce_count) {
         return;
     }
 
-    uint nonce = start_nonce + gid;
+    const uint nonce = start_nonce + gid;
 
-    __private uchar header80[80];
-    for (uint i = 0u; i < 76u; ++i) {
-        header80[i] = header_prefix76[i];
+    // First SHA-256: second 64-byte block only
+    uint s1[8];
+    uint w1[16];
+
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        s1[i] = l_midstate[i];
     }
-    header80[76] = (uchar)(nonce & 0xffu);
-    header80[77] = (uchar)((nonce >> 8) & 0xffu);
-    header80[78] = (uchar)((nonce >> 16) & 0xffu);
-    header80[79] = (uchar)((nonce >> 24) & 0xffu);
 
-    __private uchar hash1[32];
-    __private uchar hash2[32];
+    w1[0]  = l_tail[0];
+    w1[1]  = l_tail[1];
+    w1[2]  = l_tail[2];
+    w1[3]  = bswap32(nonce);   // nonce is appended little-endian in the header
+    w1[4]  = 0x80000000u;
+    w1[5]  = 0u;
+    w1[6]  = 0u;
+    w1[7]  = 0u;
+    w1[8]  = 0u;
+    w1[9]  = 0u;
+    w1[10] = 0u;
+    w1[11] = 0u;
+    w1[12] = 0u;
+    w1[13] = 0u;
+    w1[14] = 0u;
+    w1[15] = 0x00000280u; // 80 bytes * 8
 
-    sha256_bytes_private(header80, 80u, hash1);
-    sha256_bytes_private(hash1, 32u, hash2);
+    sha256_compress_16w(s1, w1);
 
-    if (!hash_meets_target_be(hash2, target32_be)) {
+    // Second SHA-256: hash the 32-byte first digest
+    uint s2[8];
+    uint w2[16];
+
+    sha256_init(s2);
+
+    w2[0]  = s1[0];
+    w2[1]  = s1[1];
+    w2[2]  = s1[2];
+    w2[3]  = s1[3];
+    w2[4]  = s1[4];
+    w2[5]  = s1[5];
+    w2[6]  = s1[6];
+    w2[7]  = s1[7];
+    w2[8]  = 0x80000000u;
+    w2[9]  = 0u;
+    w2[10] = 0u;
+    w2[11] = 0u;
+    w2[12] = 0u;
+    w2[13] = 0u;
+    w2[14] = 0u;
+    w2[15] = 0x00000100u; // 32 bytes * 8
+
+    sha256_compress_16w(s2, w2);
+
+    if (!hash_meets_target_be_words(s2, l_target)) {
         return;
     }
 
@@ -178,7 +256,16 @@ __kernel void btc_sha256d_scan(
     }
 
     out_nonces[slot] = nonce;
-    for (uint i = 0u; i < 32u; ++i) {
-        out_hashes32_be[(slot * 32u) + i] = hash2[31u - i];
-    }
+
+    // Preserve original output behavior:
+    // output reversed digest byte order
+    __global uchar* dst = out_hashes32_be + (slot * 32u);
+    write_le32_global(dst +  0u, s2[7]);
+    write_le32_global(dst +  4u, s2[6]);
+    write_le32_global(dst +  8u, s2[5]);
+    write_le32_global(dst + 12u, s2[4]);
+    write_le32_global(dst + 16u, s2[3]);
+    write_le32_global(dst + 20u, s2[2]);
+    write_le32_global(dst + 24u, s2[1]);
+    write_le32_global(dst + 28u, s2[0]);
 }
