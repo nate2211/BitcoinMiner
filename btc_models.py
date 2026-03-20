@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 
@@ -52,11 +52,21 @@ class BtcMinerConfig:
     stats_log_interval_s: float = 5.0
     stats_window_s: float = 30.0
 
+    # Verification
+    verify_opencl_hits_before_submit: bool = True
+
     def normalized_scan_backend(self) -> str:
         text = (self.scan_backend or "opencl").strip().lower()
         if text in {"opencl", "native", "python", "auto"}:
             return text
         return "opencl"
+
+    @classmethod
+    def from_mapping(cls, raw: dict[str, Any] | None) -> "BtcMinerConfig":
+        data = dict(raw or {})
+        allowed = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in data.items() if k in allowed}
+        return cls(**kwargs)
 
 
 @dataclass

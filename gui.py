@@ -181,6 +181,22 @@ def _logs_dir() -> str:
     return str(fallback)
 
 
+def _config_from_raw(raw: dict) -> BtcMinerConfig:
+    try:
+        from_mapping = getattr(BtcMinerConfig, "from_mapping", None)
+        if callable(from_mapping):
+            return from_mapping(raw)
+    except Exception:
+        pass
+
+    allowed = set(getattr(BtcMinerConfig, "__dataclass_fields__", {}).keys())
+    if allowed:
+        filtered = {k: v for k, v in dict(raw or {}).items() if k in allowed}
+        return BtcMinerConfig(**filtered)
+
+    return BtcMinerConfig(**dict(raw or {}))
+
+
 CONFIG_PATH = _resolve_save_config_path()
 
 
@@ -360,8 +376,8 @@ class BitcoinMinerWindow(QMainWindow):
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
 
         self.side_status_value = QLabel("idle")
         self.side_status_value.setObjectName("InlineValue")
@@ -369,12 +385,23 @@ class BitcoinMinerWindow(QMainWindow):
         self.side_scanner_value = QLabel("-")
         self.side_scanner_value.setObjectName("InlineValue")
 
-        row.addWidget(QLabel("Status:"))
-        row.addWidget(self.side_status_value, 1)
-        row.addWidget(QLabel("Scanner:"))
-        row.addWidget(self.side_scanner_value, 1)
+        row1.addWidget(QLabel("Status:"))
+        row1.addWidget(self.side_status_value, 1)
+        row1.addWidget(QLabel("Scanner:"))
+        row1.addWidget(self.side_scanner_value, 1)
 
-        layout.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+
+        self.side_verify_value = QLabel("on")
+        self.side_verify_value.setObjectName("InlineValue")
+
+        row2.addWidget(QLabel("CPU verify:"))
+        row2.addWidget(self.side_verify_value, 1)
+        row2.addStretch(1)
+
+        layout.addLayout(row1)
+        layout.addLayout(row2)
         return group
 
     def _build_bottom_button_bar(self) -> QWidget:
@@ -448,6 +475,11 @@ class BitcoinMinerWindow(QMainWindow):
         self.scan_backend_combo = QComboBox()
         self.scan_backend_combo.addItems(["opencl", "native", "python", "auto"])
 
+        self.verify_opencl_hits_check = QCheckBox("Verify OpenCL GPU hits on CPU/native before submit")
+        self.verify_opencl_hits_check.setToolTip(
+            "When enabled, OpenCL hits are rechecked on CPU/native before mining.submit."
+        )
+
         self.native_dll_edit = QLineEdit()
         dll_row = QHBoxLayout()
         dll_row.setSpacing(6)
@@ -458,6 +490,7 @@ class BitcoinMinerWindow(QMainWindow):
         dll_row.addWidget(dll_browse)
 
         form.addRow("Scan backend:", self.scan_backend_combo)
+        form.addRow("", self.verify_opencl_hits_check)
         form.addRow("Native DLL:", self._wrap_layout(dll_row))
         return group
 
@@ -809,6 +842,7 @@ class BitcoinMinerWindow(QMainWindow):
             socket_timeout_s=60.0,
             submit_timeout_s=15.0,
             idle_sleep_s=0.10,
+            verify_opencl_hits_before_submit=True,
         )
 
     def _load_config(self) -> None:
@@ -822,7 +856,7 @@ class BitcoinMinerWindow(QMainWindow):
             try:
                 with open(candidate, "r", encoding="utf-8") as f:
                     raw = json.load(f)
-                cfg = BtcMinerConfig(**raw)
+                cfg = _config_from_raw(raw)
                 CONFIG_PATH = candidate
                 break
             except Exception as exc:
@@ -852,6 +886,7 @@ class BitcoinMinerWindow(QMainWindow):
         self.use_tls_check.setChecked(bool(cfg.use_tls))
 
         self.scan_backend_combo.setCurrentText(cfg.normalized_scan_backend())
+        self.verify_opencl_hits_check.setChecked(bool(getattr(cfg, "verify_opencl_hits_before_submit", True)))
         self.native_dll_edit.setText(cfg.native_dll_path)
 
         self.opencl_loader_edit.setText(cfg.opencl_loader)
@@ -866,6 +901,8 @@ class BitcoinMinerWindow(QMainWindow):
         self.socket_timeout_spin.setValue(int(round(cfg.socket_timeout_s)))
         self.submit_timeout_spin.setValue(int(round(cfg.submit_timeout_s)))
         self.idle_sleep_ms_spin.setValue(int(round(cfg.idle_sleep_s * 1000.0)))
+
+        self._update_verify_display(bool(getattr(cfg, "verify_opencl_hits_before_submit", True)))
 
     def _collect_config(self) -> BtcMinerConfig:
         local_work_size = int(self.local_work_size_spin.value())
@@ -889,6 +926,7 @@ class BitcoinMinerWindow(QMainWindow):
             socket_timeout_s=float(self.socket_timeout_spin.value()),
             submit_timeout_s=float(self.submit_timeout_spin.value()),
             idle_sleep_s=float(self.idle_sleep_ms_spin.value()) / 1000.0,
+            verify_opencl_hits_before_submit=self.verify_opencl_hits_check.isChecked(),
         )
 
     def _refresh_devices(self, initial: bool = False) -> None:
@@ -928,6 +966,9 @@ class BitcoinMinerWindow(QMainWindow):
         if device_index >= 0:
             self.device_spin.setValue(int(device_index))
 
+    def _update_verify_display(self, enabled: bool) -> None:
+        self.side_verify_value.setText("on" if enabled else "off")
+
     def _start_miner(self) -> None:
         if self.thread is not None and self.thread.isRunning():
             return
@@ -963,6 +1004,7 @@ class BitcoinMinerWindow(QMainWindow):
 
         self.backend_card.set_value(cfg.normalized_scan_backend())
         self.side_scanner_value.setText(cfg.normalized_scan_backend())
+        self._update_verify_display(bool(getattr(cfg, "verify_opencl_hits_before_submit", True)))
         self.right_tabs.setCurrentIndex(0)
         self._sync_button_state(running=True)
 
@@ -1049,10 +1091,19 @@ class BitcoinMinerWindow(QMainWindow):
             QMessageBox.critical(self, "Save Log Failed", str(exc))
 
     def _parse_log_for_cards(self, line: str) -> None:
-        if "[worker] scanner=" in line:
-            scanner_name = line.split("scanner=", 1)[1].strip()
+        m_scanner = re.search(
+            r"\[worker\]\s+scanner=([^\s]+)(?:\s+verify_opencl_hits_before_submit=(on|off))?",
+            line,
+        )
+        if m_scanner:
+            scanner_name = m_scanner.group(1).strip()
+            verify_mode = (m_scanner.group(2) or "").strip().lower()
+
             self.backend_card.set_value(scanner_name)
             self.side_scanner_value.setText(scanner_name)
+
+            if verify_mode in {"on", "off"}:
+                self.side_verify_value.setText(verify_mode)
 
         m_job = re.search(r"\[worker\] new_job job_id=([^\s]+)", line)
         if m_job:

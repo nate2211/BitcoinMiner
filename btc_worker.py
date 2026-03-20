@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from btc_models import BtcMinerConfig, BtcStratumJob, PreparedWork
+from btc_models import BtcMinerConfig, BtcStratumJob, CandidateShare, PreparedWork
 from btc_native import BitcoinNativeBridge
 from btc_opencl_scanner import OpenCLSha256dScanner
 from btc_reference_scanner import CpuExactSha256dScanner
@@ -20,6 +20,7 @@ class _StatsSnapshot:
     rejected: int = 0
     errors: int = 0
     verify_failed: int = 0
+    verified_before_submit: int = 0
     stale_skipped: int = 0
 
 
@@ -27,13 +28,11 @@ class _HashrateTracker:
     def __init__(self, window_s: float) -> None:
         self.window_s = max(1.0, float(window_s))
         self.samples: collections.deque[tuple[float, int]] = collections.deque()
-        self.total_nonces = 0
 
     def add(self, nonce_count: int) -> None:
         now = time.time()
         c = max(0, int(nonce_count))
         self.samples.append((now, c))
-        self.total_nonces += c
         self._trim(now)
 
     def rate_hs(self) -> float:
@@ -94,9 +93,13 @@ class BitcoinMinerWorker:
             on_session_update=self._on_session_update,
         )
 
+        self._scanner_kind = "python"
         self.scanner = self._make_scanner()
-        self.verifier = CpuExactSha256dScanner(self.on_log, native=self.native if self.native.available else None)
-        self.verifier.initialize()
+
+        verify_mode = "on" if self._should_verify_opencl_hits() else "off"
+        self.on_log(
+            f"[worker] scanner={self._scanner_kind} verify_opencl_hits_before_submit={verify_mode}"
+        )
 
     def _make_scanner(self):
         backend = self.config.normalized_scan_backend()
@@ -105,7 +108,7 @@ class BitcoinMinerWorker:
             try:
                 scanner = OpenCLSha256dScanner(self.config, self.on_log)
                 scanner.initialize()
-                self.on_log("[worker] scanner=opencl")
+                self._scanner_kind = "opencl"
                 return scanner
             except Exception as exc:
                 self.on_log(f"[worker] opencl unavailable: {exc}")
@@ -113,13 +116,16 @@ class BitcoinMinerWorker:
         if backend in {"native", "auto"} and self.native.available:
             scanner = CpuExactSha256dScanner(self.on_log, native=self.native)
             scanner.initialize()
-            self.on_log("[worker] scanner=native")
+            self._scanner_kind = "native"
             return scanner
 
         scanner = CpuExactSha256dScanner(self.on_log, native=self.native if self.native.available else None)
         scanner.initialize()
-        self.on_log("[worker] scanner=python")
+        self._scanner_kind = "python"
         return scanner
+
+    def _should_verify_opencl_hits(self) -> bool:
+        return self._scanner_kind == "opencl" and bool(self.config.verify_opencl_hits_before_submit)
 
     def stop(self) -> None:
         self._stop.set()
@@ -174,10 +180,6 @@ class BitcoinMinerWorker:
                 self.scanner.close()
             except Exception:
                 pass
-            try:
-                self.verifier.close()
-            except Exception:
-                pass
 
     def _session_loop(self) -> None:
         while not self._stop.is_set():
@@ -211,8 +213,8 @@ class BitcoinMinerWorker:
                 self._nonce_cursor += count
 
             self.on_log(
-                f"[scan] job={job.job_id} extranonce2={work.extranonce2_hex} "
-                f"start_nonce={start_nonce:08x} count={count}"
+                f"[scan] backend={self._scanner_kind} job={job.job_id} "
+                f"extranonce2={work.extranonce2_hex} start_nonce={start_nonce:08x} count={count}"
             )
 
             scan_t0 = time.time()
@@ -229,28 +231,42 @@ class BitcoinMinerWorker:
             if not found:
                 continue
 
+            verify_before_submit = self._should_verify_opencl_hits()
+
             for share in found:
                 if self._is_stale_share(share.job_id):
                     self._stats.stale_skipped += 1
                     self.on_log(
-                        f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} reason=current job changed"
+                        f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} "
+                        f"reason=current job changed"
                     )
                     continue
 
-                verified_hash_hex = self._verify_share_exact(work, share.nonce)
-                if not verified_hash_hex:
-                    self._stats.verify_failed += 1
-                    self.on_log(
-                        f"[submit] verify-failed job={share.job_id} nonce={share.nonce:08x} "
-                        f"reason=candidate did not meet target on exact recheck"
-                    )
-                    continue
+                final_hash_hex = (share.header_hash_hex or "").strip().lower()
+
+                if verify_before_submit:
+                    verified_hash_hex, verify_note = self._verify_share_exact(work, share)
+                    if not verified_hash_hex:
+                        self._stats.verify_failed += 1
+                        self.on_log(
+                            f"[submit] verify-failed job={share.job_id} nonce={share.nonce:08x} "
+                            f"reason=exact cpu/native recheck did not meet share target"
+                        )
+                        continue
+
+                    self._stats.verified_before_submit += 1
+                    final_hash_hex = verified_hash_hex
+
+                    if verify_note:
+                        self.on_log(
+                            f"[verify] job={share.job_id} nonce={share.nonce:08x} note={verify_note}"
+                        )
 
                 result = self.client.submit(share)
                 if result.accepted:
                     self._stats.accepted += 1
                     self.on_log(
-                        f"[submit] accepted job={share.job_id} nonce={share.nonce:08x} hash={verified_hash_hex}"
+                        f"[submit] accepted job={share.job_id} nonce={share.nonce:08x} hash={final_hash_hex}"
                     )
                 else:
                     if result.status == "error":
@@ -275,7 +291,6 @@ class BitcoinMinerWorker:
         )
 
     def _on_session_update(self, reason: str) -> None:
-        # Any session change can invalidate prepared work.
         with self._job_lock:
             self._prepared_work = None
             self._nonce_cursor = 0
@@ -321,8 +336,8 @@ class BitcoinMinerWorker:
             current_job_id = self._current_job.job_id if self._current_job is not None else None
         return current_job_id != share_job_id
 
-    def _verify_share_exact(self, work: PreparedWork, nonce: int) -> str:
-        header80 = build_header80(work.header_prefix76, nonce)
+    def _verify_share_exact(self, work: PreparedWork, share: CandidateShare) -> tuple[str, str]:
+        header80 = build_header80(work.header_prefix76, share.nonce)
 
         if self.native is not None and self.native.available:
             raw_hash = self.native.sha256d_header80(header80)
@@ -330,9 +345,15 @@ class BitcoinMinerWorker:
             raw_hash = dbl_sha256(header80)
 
         if not hash_meets_target(raw_hash, work.share_target_int):
-            return ""
+            return "", ""
 
-        return hash_to_display_hex(raw_hash)
+        exact_hash_hex = hash_to_display_hex(raw_hash)
+        gpu_hash_hex = (share.header_hash_hex or "").strip().lower()
+
+        if gpu_hash_hex and gpu_hash_hex != exact_hash_hex:
+            return exact_hash_hex, f"gpu/cpu hash mismatch gpu={gpu_hash_hex} cpu={exact_hash_hex}; using cpu/native result"
+
+        return exact_hash_hex, ""
 
     def _maybe_log_stats(self, inst_hs: Optional[float] = None) -> None:
         now = time.time()
@@ -352,6 +373,7 @@ class BitcoinMinerWorker:
             f"accepted={self._stats.accepted} "
             f"rejected={self._stats.rejected} "
             f"errors={self._stats.errors} "
+            f"verified={self._stats.verified_before_submit} "
             f"verify_failed={self._stats.verify_failed} "
             f"stale={self._stats.stale_skipped}"
         )
