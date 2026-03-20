@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import QThread, Qt, pyqtSignal
@@ -38,18 +39,149 @@ from btc_opencl_scanner import OpenCLSha256dScanner
 from btc_worker import BitcoinMinerWorker
 
 
-def _base_dir() -> str:
-    return os.path.abspath(os.path.dirname(__file__))
+CONFIG_FILENAME = "bitcoin_gui_config.json"
+LOGS_DIRNAME = "logs"
 
 
-def _config_path() -> str:
-    return os.path.join(_base_dir(), "bitcoin_gui_config.json")
+def _module_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _exe_dir() -> Path:
+    return Path(sys.executable).resolve().parent
+
+
+def _cwd_dir() -> Path:
+    return Path.cwd().resolve()
+
+
+def _meipass_dir() -> Optional[Path]:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return None
+    try:
+        return Path(meipass).resolve()
+    except Exception:
+        return None
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _resource_candidates(name_or_path: str) -> list[Path]:
+    raw = (name_or_path or "").strip()
+    if not raw:
+        return []
+
+    p = Path(raw)
+    if p.is_absolute():
+        return [p.resolve()]
+
+    paths: list[Path] = [
+        _exe_dir() / raw,
+        _cwd_dir() / raw,
+        _module_dir() / raw,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        paths.append(meipass / raw)
+    return _unique_paths(paths)
+
+
+def _resolve_resource(name_or_path: str, default_name: str) -> str:
+    raw = (name_or_path or "").strip() or default_name
+    candidates = _resource_candidates(raw)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    if candidates:
+        return str(candidates[0])
+    return str(_exe_dir() / default_name)
+
+
+def _config_load_candidates() -> list[Path]:
+    paths: list[Path] = [
+        _exe_dir() / CONFIG_FILENAME,
+        _cwd_dir() / CONFIG_FILENAME,
+        _module_dir() / CONFIG_FILENAME,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        paths.append(meipass / CONFIG_FILENAME)
+    return _unique_paths(paths)
+
+
+def _config_save_candidates() -> list[Path]:
+    paths: list[Path] = [
+        _exe_dir() / CONFIG_FILENAME,
+        _cwd_dir() / CONFIG_FILENAME,
+        _module_dir() / CONFIG_FILENAME,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        paths.append(meipass / CONFIG_FILENAME)
+    return _unique_paths(paths)
+
+
+def _is_writable_target(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        test_file = path.parent / ".bitcoin_cfg_write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_load_config_path() -> Optional[Path]:
+    for candidate in _config_load_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_save_config_path() -> Path:
+    for candidate in _config_save_candidates():
+        if _is_writable_target(candidate):
+            return candidate
+    return _cwd_dir() / CONFIG_FILENAME
 
 
 def _logs_dir() -> str:
-    path = os.path.join(_base_dir(), "logs")
-    os.makedirs(path, exist_ok=True)
-    return path
+    candidates = [
+        _exe_dir() / LOGS_DIRNAME,
+        _cwd_dir() / LOGS_DIRNAME,
+        _module_dir() / LOGS_DIRNAME,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        candidates.append(meipass / LOGS_DIRNAME)
+
+    for candidate in _unique_paths(candidates):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_file = candidate / ".logs_write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            return str(candidate)
+        except Exception:
+            pass
+
+    fallback = _cwd_dir() / LOGS_DIRNAME
+    fallback.mkdir(parents=True, exist_ok=True)
+    return str(fallback)
+
+
+CONFIG_PATH = _resolve_save_config_path()
 
 
 class StatCard(QFrame):
@@ -665,9 +797,9 @@ class BitcoinMinerWindow(QMainWindow):
             agent="OpenCL-BTC/0.2",
             use_tls=False,
             scan_backend="opencl",
-            native_dll_path=os.path.join(_base_dir(), "BitcoinProject.dll"),
-            opencl_loader=os.path.join(_base_dir(), "OpenCL.dll"),
-            kernel_path=os.path.join(_base_dir(), "btc_sha256d_scan.cl"),
+            native_dll_path=_resolve_resource("", "BitcoinProject.dll"),
+            opencl_loader=_resolve_resource("", "OpenCL.dll"),
+            kernel_path=_resolve_resource("", "btc_sha256d_scan.cl"),
             build_options="-cl-std=CL1.2",
             platform_index=0,
             device_index=0,
@@ -680,25 +812,34 @@ class BitcoinMinerWindow(QMainWindow):
         )
 
     def _load_config(self) -> None:
-        cfg = self._default_config()
-        path = _config_path()
+        global CONFIG_PATH
 
-        if os.path.exists(path):
+        cfg = self._default_config()
+
+        for candidate in _config_load_candidates():
+            if not candidate.exists():
+                continue
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(candidate, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 cfg = BtcMinerConfig(**raw)
+                CONFIG_PATH = candidate
+                break
             except Exception as exc:
-                self._append_log(f"[gui] failed to load config, using defaults: {exc}")
+                self._append_log(f"[gui] failed to load config from {candidate}: {exc}")
 
         self._apply_config(cfg)
 
     def _save_config(self) -> None:
+        global CONFIG_PATH
+
         try:
             cfg = self._collect_config()
-            with open(_config_path(), "w", encoding="utf-8") as f:
+            CONFIG_PATH = _resolve_save_config_path()
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(asdict(cfg), f, indent=2)
-            self._append_log(f"[gui] config saved to {_config_path()}")
+            self._append_log(f"[gui] config saved to {CONFIG_PATH}")
         except Exception as exc:
             QMessageBox.critical(self, "Save Config Failed", str(exc))
 
@@ -943,7 +1084,7 @@ class BitcoinMinerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select BitcoinProject DLL",
-            self.native_dll_edit.text().strip() or _base_dir(),
+            self.native_dll_edit.text().strip() or str(_exe_dir()),
             "DLL Files (*.dll);;All Files (*)",
         )
         if path:
@@ -953,7 +1094,7 @@ class BitcoinMinerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select OpenCL Kernel",
-            self.kernel_path_edit.text().strip() or _base_dir(),
+            self.kernel_path_edit.text().strip() or str(_exe_dir()),
             "OpenCL Files (*.cl);;All Files (*)",
         )
         if path:

@@ -19,39 +19,19 @@ __constant uint K[64] = {
     0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
 };
 
-inline uint rotr32(uint x, uint n) {
-    return rotate(x, 32u - n);
-}
-
-inline uint ch32(uint x, uint y, uint z) {
-    return (x & y) ^ (~x & z);
-}
-
-inline uint maj32(uint x, uint y, uint z) {
-    return (x & y) ^ (x & z) ^ (y & z);
-}
-
-inline uint bsig0(uint x) {
-    return rotr32(x, 2u) ^ rotr32(x, 13u) ^ rotr32(x, 22u);
-}
-
-inline uint bsig1(uint x) {
-    return rotr32(x, 6u) ^ rotr32(x, 11u) ^ rotr32(x, 25u);
-}
-
-inline uint ssig0(uint x) {
-    return rotr32(x, 7u) ^ rotr32(x, 18u) ^ (x >> 3u);
-}
-
-inline uint ssig1(uint x) {
-    return rotr32(x, 17u) ^ rotr32(x, 19u) ^ (x >> 10u);
-}
+inline uint rotr32(uint x, uint n) { return rotate(x, 32u - n); }
+inline uint ch32(uint x, uint y, uint z) { return (x & y) ^ (~x & z); }
+inline uint maj32(uint x, uint y, uint z) { return (x & y) ^ (x & z) ^ (y & z); }
+inline uint bsig0(uint x) { return rotr32(x, 2u) ^ rotr32(x, 13u) ^ rotr32(x, 22u); }
+inline uint bsig1(uint x) { return rotr32(x, 6u) ^ rotr32(x, 11u) ^ rotr32(x, 25u); }
+inline uint ssig0(uint x) { return rotr32(x, 7u) ^ rotr32(x, 18u) ^ (x >> 3u); }
+inline uint ssig1(uint x) { return rotr32(x, 17u) ^ rotr32(x, 19u) ^ (x >> 10u); }
 
 inline uint read_be32_global(__global const uchar* p) {
     return ((uint)p[0] << 24) |
            ((uint)p[1] << 16) |
-           ((uint)p[2] << 8)  |
-           (uint)p[3];
+           ((uint)p[2] <<  8) |
+           ((uint)p[3]);
 }
 
 inline void write_le32_global(__global uchar* p, uint v) {
@@ -89,30 +69,28 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
     uint g = state[6];
     uint h = state[7];
 
+    // rounds 0..15
     #pragma unroll
-    for (uint i = 0u; i < 64u; ++i) {
-        uint wi;
-        if (i < 16u) {
-            wi = w[i];
-        } else {
-            wi = w[i & 15u]
-               + ssig0(w[(i + 1u) & 15u])
-               + w[(i + 9u) & 15u]
-               + ssig1(w[(i + 14u) & 15u]);
-            w[i & 15u] = wi;
-        }
+    for (uint i = 0u; i < 16u; ++i) {
+        uint t1 = h + bsig1(e) + ch32(e, f, g) + K[i] + w[i];
+        uint t2 = bsig0(a) + maj32(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    // rounds 16..63
+    #pragma unroll
+    for (uint i = 16u; i < 64u; ++i) {
+        uint wi = w[i & 15u]
+                + ssig0(w[(i + 1u) & 15u])
+                + w[(i + 9u) & 15u]
+                + ssig1(w[(i + 14u) & 15u]);
+        w[i & 15u] = wi;
 
         uint t1 = h + bsig1(e) + ch32(e, f, g) + K[i] + wi;
         uint t2 = bsig0(a) + maj32(a, b, c);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
     }
 
     state[0] += a;
@@ -125,16 +103,23 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
     state[7] += h;
 }
 
-inline int hash_meets_target_be_words(
-    __private const uint hash_be_words[8],
+// Compare Bitcoin-style display hash (reversed raw bytes) against big-endian target.
+// That means comparing bswap32(s2[7]), bswap32(s2[6]), ... bswap32(s2[0]).
+inline int btc_hash_meets_target_from_state(
+    __private const uint s2[8],
     __local const uint* target_be_words
 ) {
-    for (uint i = 0u; i < 8u; ++i) {
-        uint hv = hash_be_words[i];
-        uint tv = target_be_words[i];
-        if (hv < tv) return 1;
-        if (hv > tv) return 0;
-    }
+    uint hv;
+
+    hv = bswap32(s2[7]); if (hv < target_be_words[0]) return 1; if (hv > target_be_words[0]) return 0;
+    hv = bswap32(s2[6]); if (hv < target_be_words[1]) return 1; if (hv > target_be_words[1]) return 0;
+    hv = bswap32(s2[5]); if (hv < target_be_words[2]) return 1; if (hv > target_be_words[2]) return 0;
+    hv = bswap32(s2[4]); if (hv < target_be_words[3]) return 1; if (hv > target_be_words[3]) return 0;
+    hv = bswap32(s2[3]); if (hv < target_be_words[4]) return 1; if (hv > target_be_words[4]) return 0;
+    hv = bswap32(s2[2]); if (hv < target_be_words[5]) return 1; if (hv > target_be_words[5]) return 0;
+    hv = bswap32(s2[1]); if (hv < target_be_words[6]) return 1; if (hv > target_be_words[6]) return 0;
+    hv = bswap32(s2[0]); if (hv < target_be_words[7]) return 1; if (hv > target_be_words[7]) return 0;
+
     return 1;
 }
 
@@ -150,9 +135,12 @@ __kernel void btc_sha256d_scan(
 ) {
     const uint gid = (uint)get_global_id(0);
     const uint lid = (uint)get_local_id(0);
+    const uint gsize = (uint)get_global_size(0);
 
     __local uint l_midstate[8];
-    __local uint l_tail[3];
+    __local uint l_tail0;
+    __local uint l_tail1;
+    __local uint l_tail2;
     __local uint l_target[8];
 
     if (lid == 0u) {
@@ -161,7 +149,7 @@ __kernel void btc_sha256d_scan(
 
         sha256_init(s);
 
-        // header_prefix76[0..63]
+        // First 64 bytes of the 80-byte block header.
         #pragma unroll
         for (uint i = 0u; i < 16u; ++i) {
             w[i] = read_be32_global(header_prefix76 + (i * 4u));
@@ -173,12 +161,12 @@ __kernel void btc_sha256d_scan(
             l_midstate[i] = s[i];
         }
 
-        // header_prefix76[64..75]
-        l_tail[0] = read_be32_global(header_prefix76 + 64u);
-        l_tail[1] = read_be32_global(header_prefix76 + 68u);
-        l_tail[2] = read_be32_global(header_prefix76 + 72u);
+        // Bytes 64..75
+        l_tail0 = read_be32_global(header_prefix76 + 64u);
+        l_tail1 = read_be32_global(header_prefix76 + 68u);
+        l_tail2 = read_be32_global(header_prefix76 + 72u);
 
-        // target32_be as 8 big-endian words
+        // Big-endian target words.
         #pragma unroll
         for (uint i = 0u; i < 8u; ++i) {
             l_target[i] = read_be32_global(target32_be + (i * 4u));
@@ -187,85 +175,83 @@ __kernel void btc_sha256d_scan(
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    if (gid >= nonce_count) {
-        return;
+    for (uint idx = gid; idx < nonce_count; idx += gsize) {
+        const uint nonce = start_nonce + idx;
+
+        // First SHA-256, block 2 only.
+        uint s1[8];
+        uint w1[16];
+
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            s1[i] = l_midstate[i];
+        }
+
+        w1[0]  = l_tail0;
+        w1[1]  = l_tail1;
+        w1[2]  = l_tail2;
+        w1[3]  = bswap32(nonce);   // nonce lives as little-endian bytes in header
+        w1[4]  = 0x80000000u;
+        w1[5]  = 0u;
+        w1[6]  = 0u;
+        w1[7]  = 0u;
+        w1[8]  = 0u;
+        w1[9]  = 0u;
+        w1[10] = 0u;
+        w1[11] = 0u;
+        w1[12] = 0u;
+        w1[13] = 0u;
+        w1[14] = 0u;
+        w1[15] = 0x00000280u; // 80 bytes * 8
+
+        sha256_compress_16w(s1, w1);
+
+        // Second SHA-256 on the 32-byte first digest.
+        uint s2[8];
+        uint w2[16];
+
+        sha256_init(s2);
+
+        w2[0]  = s1[0];
+        w2[1]  = s1[1];
+        w2[2]  = s1[2];
+        w2[3]  = s1[3];
+        w2[4]  = s1[4];
+        w2[5]  = s1[5];
+        w2[6]  = s1[6];
+        w2[7]  = s1[7];
+        w2[8]  = 0x80000000u;
+        w2[9]  = 0u;
+        w2[10] = 0u;
+        w2[11] = 0u;
+        w2[12] = 0u;
+        w2[13] = 0u;
+        w2[14] = 0u;
+        w2[15] = 0x00000100u; // 32 bytes * 8
+
+        sha256_compress_16w(s2, w2);
+
+        if (!btc_hash_meets_target_from_state(s2, l_target)) {
+            continue;
+        }
+
+        uint slot = atomic_inc((volatile __global uint*)out_count);
+        if (slot >= max_results) {
+            return;
+        }
+
+        out_nonces[slot] = nonce;
+
+        // Same output format as your current code / CPU path:
+        // reversed digest byte order as display big-endian bytes
+        __global uchar* dst = out_hashes32_be + (slot * 32u);
+        write_le32_global(dst +  0u, s2[7]);
+        write_le32_global(dst +  4u, s2[6]);
+        write_le32_global(dst +  8u, s2[5]);
+        write_le32_global(dst + 12u, s2[4]);
+        write_le32_global(dst + 16u, s2[3]);
+        write_le32_global(dst + 20u, s2[2]);
+        write_le32_global(dst + 24u, s2[1]);
+        write_le32_global(dst + 28u, s2[0]);
     }
-
-    const uint nonce = start_nonce + gid;
-
-    // First SHA-256: second 64-byte block only
-    uint s1[8];
-    uint w1[16];
-
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        s1[i] = l_midstate[i];
-    }
-
-    w1[0]  = l_tail[0];
-    w1[1]  = l_tail[1];
-    w1[2]  = l_tail[2];
-    w1[3]  = bswap32(nonce);   // nonce is appended little-endian in the header
-    w1[4]  = 0x80000000u;
-    w1[5]  = 0u;
-    w1[6]  = 0u;
-    w1[7]  = 0u;
-    w1[8]  = 0u;
-    w1[9]  = 0u;
-    w1[10] = 0u;
-    w1[11] = 0u;
-    w1[12] = 0u;
-    w1[13] = 0u;
-    w1[14] = 0u;
-    w1[15] = 0x00000280u; // 80 bytes * 8
-
-    sha256_compress_16w(s1, w1);
-
-    // Second SHA-256: hash the 32-byte first digest
-    uint s2[8];
-    uint w2[16];
-
-    sha256_init(s2);
-
-    w2[0]  = s1[0];
-    w2[1]  = s1[1];
-    w2[2]  = s1[2];
-    w2[3]  = s1[3];
-    w2[4]  = s1[4];
-    w2[5]  = s1[5];
-    w2[6]  = s1[6];
-    w2[7]  = s1[7];
-    w2[8]  = 0x80000000u;
-    w2[9]  = 0u;
-    w2[10] = 0u;
-    w2[11] = 0u;
-    w2[12] = 0u;
-    w2[13] = 0u;
-    w2[14] = 0u;
-    w2[15] = 0x00000100u; // 32 bytes * 8
-
-    sha256_compress_16w(s2, w2);
-
-    if (!hash_meets_target_be_words(s2, l_target)) {
-        return;
-    }
-
-    uint slot = atomic_inc((volatile __global uint*)out_count);
-    if (slot >= max_results) {
-        return;
-    }
-
-    out_nonces[slot] = nonce;
-
-    // Preserve original output behavior:
-    // output reversed digest byte order
-    __global uchar* dst = out_hashes32_be + (slot * 32u);
-    write_le32_global(dst +  0u, s2[7]);
-    write_le32_global(dst +  4u, s2[6]);
-    write_le32_global(dst +  8u, s2[5]);
-    write_le32_global(dst + 12u, s2[4]);
-    write_le32_global(dst + 16u, s2[3]);
-    write_le32_global(dst + 20u, s2[2]);
-    write_le32_global(dst + 24u, s2[1]);
-    write_le32_global(dst + 28u, s2[0]);
 }

@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-import pyopencl as cl
+
+try:
+    import pyopencl as cl
+except Exception:
+    cl = None
 
 from btc_models import BtcMinerConfig, CandidateShare, PreparedWork
 
@@ -21,55 +25,80 @@ class OpenCLDeviceInfo:
     device_name: str
 
 
-def _runtime_base_dir() -> Path:
-    """
-    Returns the directory that should be treated as the app base:
-    - PyInstaller one-file/one-dir bundle: sys._MEIPASS
-    - normal Python execution: directory of this file
-    """
-    if getattr(sys, "frozen", False):
+def _search_roots() -> list[Path]:
+    roots: list[Path] = []
+
+    try:
+        roots.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+
+    try:
+        roots.append(Path.cwd().resolve())
+    except Exception:
+        pass
+
+    try:
+        roots.append(Path(sys.executable).resolve().parent)
+    except Exception:
+        pass
+
+    try:
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            return Path(meipass)
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+            roots.append(Path(meipass).resolve())
+    except Exception:
+        pass
 
-
-def _candidate_paths(path: str) -> list[Path]:
-    """
-    Build a list of possible locations for a resource.
-    """
-    p = Path(path)
-    bases = [
-        Path.cwd(),
-        _runtime_base_dir(),
-        Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent,
-    ]
-
-    candidates: list[Path] = []
-
-    if p.is_absolute():
-        candidates.append(p)
-    else:
-        for base in bases:
-            candidates.append((base / p).resolve())
-
+    out: list[Path] = []
     seen: set[str] = set()
-    unique: list[Path] = []
-    for c in candidates:
-        s = str(c)
-        if s not in seen:
-            seen.add(s)
-            unique.append(c)
-    return unique
+    for root in roots:
+        key = os.path.normcase(str(root))
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
 
 
-def _resolve_existing_path(path: str) -> str:
-    for candidate in _candidate_paths(path):
+def _candidate_paths(path: str, default_name: str | None = None) -> list[Path]:
+    raw = (path or "").strip()
+    candidates: list[Path] = []
+    roots = _search_roots()
+
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            candidates.append(p.resolve())
+            basename = p.name
+            if basename:
+                for root in roots:
+                    candidates.append((root / basename).resolve())
+        else:
+            for root in roots:
+                candidates.append((root / raw).resolve())
+    elif default_name:
+        for root in roots:
+            candidates.append((root / default_name).resolve())
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate))
+        if key not in seen:
+            seen.add(key)
+            out.append(candidate)
+    return out
+
+
+def _resolve_existing_path(path: str, default_name: str | None = None) -> str:
+    candidates = _candidate_paths(path, default_name)
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    # fall back to the most likely runtime path
-    return str(_candidate_paths(path)[0])
+    if candidates:
+        searched = "\n  ".join(str(p) for p in candidates)
+        raise FileNotFoundError(f"Could not locate path. Tried:\n  {searched}")
+    raise FileNotFoundError(f"Could not locate path for {path!r}")
 
 
 class OpenCLSha256dScanner:
@@ -77,15 +106,15 @@ class OpenCLSha256dScanner:
         self.config = config
         self.on_log = on_log
 
-        self.ctx: Optional[cl.Context] = None
-        self.queue: Optional[cl.CommandQueue] = None
-        self.program: Optional[cl.Program] = None
+        self.ctx: Optional["cl.Context"] = None
+        self.queue: Optional["cl.CommandQueue"] = None
+        self.program: Optional["cl.Program"] = None
         self.kernel = None
         self.device = None
 
-        self._out_nonces_buf: Optional[cl.Buffer] = None
-        self._out_hashes_buf: Optional[cl.Buffer] = None
-        self._out_count_buf: Optional[cl.Buffer] = None
+        self._out_nonces_buf: Optional["cl.Buffer"] = None
+        self._out_hashes_buf: Optional["cl.Buffer"] = None
+        self._out_count_buf: Optional["cl.Buffer"] = None
 
         self._out_nonces_np: Optional[np.ndarray] = None
         self._out_hashes_np: Optional[np.ndarray] = None
@@ -93,9 +122,13 @@ class OpenCLSha256dScanner:
 
         self._out_capacity: int = 0
         self._effective_local_work_size: Optional[int] = None
+        self._dll_dir_handles: list[object] = []
 
     @staticmethod
     def list_devices() -> list[OpenCLDeviceInfo]:
+        if cl is None:
+            return []
+
         out: list[OpenCLDeviceInfo] = []
         for p_idx, platform in enumerate(cl.get_platforms()):
             for d_idx, device in enumerate(platform.get_devices()):
@@ -110,6 +143,9 @@ class OpenCLSha256dScanner:
         return out
 
     def initialize(self) -> None:
+        if cl is None:
+            raise RuntimeError("pyopencl is not installed")
+
         self._ensure_opencl_loader()
 
         platforms = cl.get_platforms()
@@ -155,6 +191,13 @@ class OpenCLSha256dScanner:
         self._out_count_np = None
         self._out_capacity = 0
 
+        for handle in self._dll_dir_handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._dll_dir_handles.clear()
+
     def scan(
         self,
         work: PreparedWork,
@@ -162,6 +205,8 @@ class OpenCLSha256dScanner:
         count: int,
         max_results: int,
     ) -> list[CandidateShare]:
+        if cl is None:
+            raise RuntimeError("pyopencl is not installed")
         if not all([self.ctx, self.queue, self.program, self.kernel]):
             raise RuntimeError("OpenCL scanner is not initialized")
 
@@ -201,7 +246,7 @@ class OpenCLSha256dScanner:
                 local_work,
                 prefix_buf,
                 np.uint32(count),
-                np.uint32(start_nonce & 0xFFFFFFFF),
+                np.uint32(int(start_nonce) & 0xFFFFFFFF),
                 target_buf,
                 np.uint32(max_results),
                 self._out_nonces_buf,
@@ -240,23 +285,59 @@ class OpenCLSha256dScanner:
                 pass
 
     def _ensure_opencl_loader(self) -> None:
-        loader = _resolve_existing_path(self.config.opencl_loader)
-        if os.name == "nt":
-            ctypes.WinDLL(loader)
-            self.on_log(f"[opencl] loaded {loader}")
+        if os.name != "nt":
+            return
 
-    def _build_program(self, ctx: cl.Context, kernel_path: str, build_options: str) -> cl.Program:
-        resolved = _resolve_existing_path(kernel_path)
+        loader_name = str(getattr(self.config, "opencl_loader", "") or "").strip()
+        candidates = _candidate_paths(loader_name, "OpenCL.dll")
+
+        resolved = None
+        for candidate in candidates:
+            if candidate.exists():
+                resolved = str(candidate)
+                break
+
+        if resolved is not None:
+            self._prepare_dll_search_dirs(resolved)
+            ctypes.WinDLL(resolved)
+            self.on_log(f"[opencl] loaded {resolved}")
+            return
+
+        # Fallback to system loader name if no explicit/private loader exists.
+        ctypes.WinDLL("OpenCL.dll")
+        self.on_log("[opencl] loaded OpenCL.dll from system search path")
+
+    def _prepare_dll_search_dirs(self, dll_path: str) -> None:
+        if os.name != "nt":
+            return
+
+        dirs: list[str] = []
+        dll_dir = os.path.abspath(os.path.dirname(dll_path))
+        dirs.append(dll_dir)
+
+        for root in _search_roots():
+            dirs.append(str(root))
+
+        seen: set[str] = set()
+        for directory in dirs:
+            if not directory or not os.path.isdir(directory):
+                continue
+
+            norm = os.path.normcase(os.path.abspath(directory))
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            try:
+                if hasattr(os, "add_dll_directory"):
+                    self._dll_dir_handles.append(os.add_dll_directory(directory))
+            except Exception:
+                pass
+
+    def _build_program(self, ctx: "cl.Context", kernel_path: str, build_options: str) -> "cl.Program":
+        resolved = _resolve_existing_path(kernel_path, "btc_sha256d_scan.cl")
         self.on_log(f"[opencl] requested kernel_path={kernel_path}")
         self.on_log(f"[opencl] resolved kernel_path={resolved}")
-
-        if not os.path.exists(resolved):
-            searched = "\n".join(f" - {p}" for p in _candidate_paths(kernel_path))
-            raise FileNotFoundError(
-                f"OpenCL kernel not found.\n"
-                f"requested: {kernel_path}\n"
-                f"searched:\n{searched}"
-            )
 
         with open(resolved, "r", encoding="utf-8", errors="replace") as f:
             src = f.read()
@@ -298,6 +379,8 @@ class OpenCLSha256dScanner:
         return int(lws)
 
     def _ensure_output_buffers(self, max_results: int) -> None:
+        if cl is None:
+            raise RuntimeError("pyopencl is not installed")
         if self.ctx is None:
             raise RuntimeError("OpenCL scanner is not initialized")
 
@@ -329,7 +412,10 @@ class OpenCLSha256dScanner:
         self._out_capacity = max_results
 
     def _reset_out_count(self) -> None:
+        if cl is None:
+            raise RuntimeError("pyopencl is not installed")
         if self.queue is None or self._out_count_buf is None:
             raise RuntimeError("Output buffers are not initialized")
+
         zero = np.zeros((1,), dtype=np.uint32)
         cl.enqueue_copy(self.queue, self._out_count_buf, zero).wait()
