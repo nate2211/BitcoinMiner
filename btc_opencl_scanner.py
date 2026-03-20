@@ -231,15 +231,11 @@ class OpenCLSha256dScanner:
         target_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=target_np)
 
         try:
-            lws = self._launch_local_size(count)
-            if lws is None:
-                global_work = (count,)
-                local_work = None
-            else:
-                rounded = ((count + lws - 1) // lws) * lws
-                global_work = (rounded,)
-                local_work = (lws,)
-
+            compute_units = int(self.device.max_compute_units)
+            lws = self._effective_local_work_size or 128
+            gws = compute_units * 16 * lws  # test 8x, 16x, 32x
+            global_work=(gws,)
+            local_work = (lws,)
             evt = self.kernel(
                 self.queue,
                 global_work,

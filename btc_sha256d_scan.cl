@@ -1,5 +1,9 @@
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
 
+#ifndef NONCES_PER_THREAD
+#define NONCES_PER_THREAD 4u
+#endif
+
 __constant uint K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
     0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
@@ -69,7 +73,6 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
     uint g = state[6];
     uint h = state[7];
 
-    // rounds 0..15
     #pragma unroll
     for (uint i = 0u; i < 16u; ++i) {
         uint t1 = h + bsig1(e) + ch32(e, f, g) + K[i] + w[i];
@@ -78,7 +81,6 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
         d = c; c = b; b = a; a = t1 + t2;
     }
 
-    // rounds 16..63
     #pragma unroll
     for (uint i = 16u; i < 64u; ++i) {
         uint wi = w[i & 15u]
@@ -103,8 +105,6 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
     state[7] += h;
 }
 
-// Compare Bitcoin-style display hash (reversed raw bytes) against big-endian target.
-// That means comparing bswap32(s2[7]), bswap32(s2[6]), ... bswap32(s2[0]).
 inline int btc_hash_meets_target_from_state(
     __private const uint s2[8],
     __local const uint* target_be_words
@@ -133,8 +133,8 @@ __kernel void btc_sha256d_scan(
     __global uchar* out_hashes32_be,
     __global uint* out_count
 ) {
-    const uint gid = (uint)get_global_id(0);
-    const uint lid = (uint)get_local_id(0);
+    const uint gid   = (uint)get_global_id(0);
+    const uint lid   = (uint)get_local_id(0);
     const uint gsize = (uint)get_global_size(0);
 
     __local uint l_midstate[8];
@@ -149,7 +149,6 @@ __kernel void btc_sha256d_scan(
 
         sha256_init(s);
 
-        // First 64 bytes of the 80-byte block header.
         #pragma unroll
         for (uint i = 0u; i < 16u; ++i) {
             w[i] = read_be32_global(header_prefix76 + (i * 4u));
@@ -161,12 +160,10 @@ __kernel void btc_sha256d_scan(
             l_midstate[i] = s[i];
         }
 
-        // Bytes 64..75
         l_tail0 = read_be32_global(header_prefix76 + 64u);
         l_tail1 = read_be32_global(header_prefix76 + 68u);
         l_tail2 = read_be32_global(header_prefix76 + 72u);
 
-        // Big-endian target words.
         #pragma unroll
         for (uint i = 0u; i < 8u; ++i) {
             l_target[i] = read_be32_global(target32_be + (i * 4u));
@@ -175,83 +172,87 @@ __kernel void btc_sha256d_scan(
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (uint idx = gid; idx < nonce_count; idx += gsize) {
-        const uint nonce = start_nonce + idx;
-
-        // First SHA-256, block 2 only.
-        uint s1[8];
-        uint w1[16];
-
+    for (uint base = gid * NONCES_PER_THREAD; base < nonce_count; base += gsize * NONCES_PER_THREAD) {
         #pragma unroll
-        for (uint i = 0u; i < 8u; ++i) {
-            s1[i] = l_midstate[i];
+        for (uint j = 0u; j < NONCES_PER_THREAD; ++j) {
+            const uint idx = base + j;
+            if (idx >= nonce_count) {
+                break;
+            }
+
+            const uint nonce = start_nonce + idx;
+
+            uint s1[8];
+            uint w1[16];
+
+            #pragma unroll
+            for (uint i = 0u; i < 8u; ++i) {
+                s1[i] = l_midstate[i];
+            }
+
+            w1[0]  = l_tail0;
+            w1[1]  = l_tail1;
+            w1[2]  = l_tail2;
+            w1[3]  = bswap32(nonce);
+            w1[4]  = 0x80000000u;
+            w1[5]  = 0u;
+            w1[6]  = 0u;
+            w1[7]  = 0u;
+            w1[8]  = 0u;
+            w1[9]  = 0u;
+            w1[10] = 0u;
+            w1[11] = 0u;
+            w1[12] = 0u;
+            w1[13] = 0u;
+            w1[14] = 0u;
+            w1[15] = 0x00000280u;
+
+            sha256_compress_16w(s1, w1);
+
+            uint s2[8];
+            uint w2[16];
+
+            sha256_init(s2);
+
+            w2[0]  = s1[0];
+            w2[1]  = s1[1];
+            w2[2]  = s1[2];
+            w2[3]  = s1[3];
+            w2[4]  = s1[4];
+            w2[5]  = s1[5];
+            w2[6]  = s1[6];
+            w2[7]  = s1[7];
+            w2[8]  = 0x80000000u;
+            w2[9]  = 0u;
+            w2[10] = 0u;
+            w2[11] = 0u;
+            w2[12] = 0u;
+            w2[13] = 0u;
+            w2[14] = 0u;
+            w2[15] = 0x00000100u;
+
+            sha256_compress_16w(s2, w2);
+
+            if (!btc_hash_meets_target_from_state(s2, l_target)) {
+                continue;
+            }
+
+            uint slot = atomic_inc((volatile __global uint*)out_count);
+            if (slot >= max_results) {
+                return;
+            }
+
+            out_nonces[slot] = nonce;
+
+            __global uchar* dst = out_hashes32_be + (slot * 32u);
+            write_le32_global(dst +  0u, s2[7]);
+            write_le32_global(dst +  4u, s2[6]);
+            write_le32_global(dst +  8u, s2[5]);
+            write_le32_global(dst + 12u, s2[4]);
+            write_le32_global(dst + 16u, s2[3]);
+            write_le32_global(dst + 20u, s2[2]);
+            write_le32_global(dst + 24u, s2[1]);
+            write_le32_global(dst + 28u, s2[0]);
         }
-
-        w1[0]  = l_tail0;
-        w1[1]  = l_tail1;
-        w1[2]  = l_tail2;
-        w1[3]  = bswap32(nonce);   // nonce lives as little-endian bytes in header
-        w1[4]  = 0x80000000u;
-        w1[5]  = 0u;
-        w1[6]  = 0u;
-        w1[7]  = 0u;
-        w1[8]  = 0u;
-        w1[9]  = 0u;
-        w1[10] = 0u;
-        w1[11] = 0u;
-        w1[12] = 0u;
-        w1[13] = 0u;
-        w1[14] = 0u;
-        w1[15] = 0x00000280u; // 80 bytes * 8
-
-        sha256_compress_16w(s1, w1);
-
-        // Second SHA-256 on the 32-byte first digest.
-        uint s2[8];
-        uint w2[16];
-
-        sha256_init(s2);
-
-        w2[0]  = s1[0];
-        w2[1]  = s1[1];
-        w2[2]  = s1[2];
-        w2[3]  = s1[3];
-        w2[4]  = s1[4];
-        w2[5]  = s1[5];
-        w2[6]  = s1[6];
-        w2[7]  = s1[7];
-        w2[8]  = 0x80000000u;
-        w2[9]  = 0u;
-        w2[10] = 0u;
-        w2[11] = 0u;
-        w2[12] = 0u;
-        w2[13] = 0u;
-        w2[14] = 0u;
-        w2[15] = 0x00000100u; // 32 bytes * 8
-
-        sha256_compress_16w(s2, w2);
-
-        if (!btc_hash_meets_target_from_state(s2, l_target)) {
-            continue;
-        }
-
-        uint slot = atomic_inc((volatile __global uint*)out_count);
-        if (slot >= max_results) {
-            return;
-        }
-
-        out_nonces[slot] = nonce;
-
-        // Same output format as your current code / CPU path:
-        // reversed digest byte order as display big-endian bytes
-        __global uchar* dst = out_hashes32_be + (slot * 32u);
-        write_le32_global(dst +  0u, s2[7]);
-        write_le32_global(dst +  4u, s2[6]);
-        write_le32_global(dst +  8u, s2[5]);
-        write_le32_global(dst + 12u, s2[4]);
-        write_le32_global(dst + 16u, s2[3]);
-        write_le32_global(dst + 20u, s2[2]);
-        write_le32_global(dst + 24u, s2[1]);
-        write_le32_global(dst + 28u, s2[0]);
     }
 }
