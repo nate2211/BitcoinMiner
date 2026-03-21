@@ -231,23 +231,21 @@ class OpenCLSha256dScanner:
         target_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=target_np)
 
         try:
-            compute_units = int(self.device.max_compute_units)
-            lws = self._effective_local_work_size or 128
-            gws = compute_units * 16 * lws  # test 8x, 16x, 32x
-            global_work=(gws,)
-            local_work = (lws,)
+            lws = self._launch_local_size(count)
+            global_work = (count,)
+            local_work = (lws,) if (lws is not None and count % lws == 0) else None
+
             evt = self.kernel(
                 self.queue,
                 global_work,
                 local_work,
                 prefix_buf,
-                np.uint32(count),
-                np.uint32(int(start_nonce) & 0xFFFFFFFF),
                 target_buf,
-                np.uint32(max_results),
                 self._out_nonces_buf,
                 self._out_hashes_buf,
                 self._out_count_buf,
+                np.uint32(int(start_nonce) & 0xFFFFFFFF),
+                np.uint32(max_results),
             )
             evt.wait()
 
@@ -269,6 +267,7 @@ class OpenCLSha256dScanner:
                             header_hash_hex=bytes(self._out_hashes_np[i]).hex(),
                         )
                     )
+
             return results
         finally:
             try:
@@ -299,7 +298,6 @@ class OpenCLSha256dScanner:
             self.on_log(f"[opencl] loaded {resolved}")
             return
 
-        # Fallback to system loader name if no explicit/private loader exists.
         ctypes.WinDLL("OpenCL.dll")
         self.on_log("[opencl] loaded OpenCL.dll from system search path")
 

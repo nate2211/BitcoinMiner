@@ -22,7 +22,7 @@ config_path = ROOT / "bitcoin_gui_config.json"
 if config_path.exists():
     datas.append((str(config_path), "."))
 
-for dll_name in ("BitcoinProject.dll", "OpenCL.dll"):
+for dll_name in ("BitcoinProject.dll", "OpenCL.dll", "VirtualASIC.dll"):
     dll_path = ROOT / dll_name
     if dll_path.exists():
         binaries.append((str(dll_path), "."))

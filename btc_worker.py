@@ -12,6 +12,7 @@ from btc_opencl_scanner import OpenCLSha256dScanner
 from btc_reference_scanner import CpuExactSha256dScanner
 from btc_stratum_connection import BitcoinStratumConnection
 from btc_utils import build_header80, dbl_sha256, hash_meets_target, hash_to_display_hex, prepare_work
+from btc_virtualasic import VirtualAsicSha256dScanner
 
 
 @dataclass
@@ -96,9 +97,9 @@ class BitcoinMinerWorker:
         self._scanner_kind = "python"
         self.scanner = self._make_scanner()
 
-        verify_mode = "on" if self._should_verify_opencl_hits() else "off"
+        verify_mode = "on" if self._should_verify_gpu_hits() else "off"
         self.on_log(
-            f"[worker] scanner={self._scanner_kind} verify_opencl_hits_before_submit={verify_mode}"
+            f"[worker] scanner={self._scanner_kind} verify_gpu_hits_before_submit={verify_mode}"
         )
 
     def _make_scanner(self):
@@ -113,6 +114,15 @@ class BitcoinMinerWorker:
             except Exception as exc:
                 self.on_log(f"[worker] opencl unavailable: {exc}")
 
+        if backend in {"virtualasic", "auto"}:
+            try:
+                scanner = VirtualAsicSha256dScanner(self.config, self.on_log)
+                scanner.initialize()
+                self._scanner_kind = "virtualasic"
+                return scanner
+            except Exception as exc:
+                self.on_log(f"[worker] virtualasic unavailable: {exc}")
+
         if backend in {"native", "auto"} and self.native.available:
             scanner = CpuExactSha256dScanner(self.on_log, native=self.native)
             scanner.initialize()
@@ -124,8 +134,8 @@ class BitcoinMinerWorker:
         self._scanner_kind = "python"
         return scanner
 
-    def _should_verify_opencl_hits(self) -> bool:
-        return self._scanner_kind == "opencl" and bool(self.config.verify_opencl_hits_before_submit)
+    def _should_verify_gpu_hits(self) -> bool:
+        return self._scanner_kind in {"opencl", "virtualasic"} and bool(self.config.verify_opencl_hits_before_submit)
 
     def stop(self) -> None:
         self._stop.set()
@@ -231,7 +241,7 @@ class BitcoinMinerWorker:
             if not found:
                 continue
 
-            verify_before_submit = self._should_verify_opencl_hits()
+            verify_before_submit = self._should_verify_gpu_hits()
 
             for share in found:
                 if self._is_stale_share(share.job_id):

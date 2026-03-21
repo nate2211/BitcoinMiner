@@ -18,11 +18,17 @@ class BtcMinerConfig:
     socket_timeout_s: float = 30.0
     submit_timeout_s: float = 10.0
 
-    # Scanner backend: "opencl" | "native" | "python" | "auto"
+    # Scanner backend: "opencl" | "virtualasic" | "native" | "python" | "auto"
     scan_backend: str = "opencl"
 
     # Native DLL
     native_dll_path: str = "BitcoinProject.dll"
+
+    # VirtualASIC
+    virtualasic_dll_path: str = "VirtualASIC.dll"
+    virtualasic_kernel_path: str = "btc_sha256d_scan.cl"
+    virtualasic_kernel_name: str = "btc_sha256d_scan"
+    virtualasic_core_count: int = 128
 
     # OpenCL
     opencl_loader: str = "OpenCL.dll"
@@ -53,11 +59,12 @@ class BtcMinerConfig:
     stats_window_s: float = 30.0
 
     # Verification
+    # Kept for backward compatibility; used for both GPU-style backends.
     verify_opencl_hits_before_submit: bool = True
 
     def normalized_scan_backend(self) -> str:
         text = (self.scan_backend or "opencl").strip().lower()
-        if text in {"opencl", "native", "python", "auto"}:
+        if text in {"opencl", "virtualasic", "native", "python", "auto"}:
             return text
         return "opencl"
 

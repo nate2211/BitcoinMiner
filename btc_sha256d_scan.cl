@@ -1,8 +1,10 @@
-#pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
+// @vasic_mode candidate_merge
+// @vasic_count_arg 4
+// @vasic_merge_buffer 2:4
+// @vasic_merge_buffer 3:32
+// @vasic_partition scalar_u32:5
 
-#ifndef NONCES_PER_THREAD
-#define NONCES_PER_THREAD 4u
-#endif
+#pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
 
 __constant uint K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
@@ -47,8 +49,8 @@ inline void write_le32_global(__global uchar* p, uint v) {
 
 inline uint bswap32(uint x) {
     return ((x & 0x000000ffu) << 24) |
-           ((x & 0x0000ff00u) << 8)  |
-           ((x & 0x00ff0000u) >> 8)  |
+           ((x & 0x0000ff00u) <<  8) |
+           ((x & 0x00ff0000u) >>  8) |
            ((x & 0xff000000u) >> 24);
 }
 
@@ -125,17 +127,15 @@ inline int btc_hash_meets_target_from_state(
 
 __kernel void btc_sha256d_scan(
     __global const uchar* header_prefix76,
-    const uint nonce_count,
-    const uint start_nonce,
     __global const uchar* target32_be,
-    const uint max_results,
     __global uint* out_nonces,
     __global uchar* out_hashes32_be,
-    __global uint* out_count
+    __global uint* out_count,
+    const uint start_nonce,
+    const uint max_results
 ) {
-    const uint gid   = (uint)get_global_id(0);
-    const uint lid   = (uint)get_local_id(0);
-    const uint gsize = (uint)get_global_size(0);
+    const uint gid = (uint)get_global_id(0);
+    const uint lid = (uint)get_local_id(0);
 
     __local uint l_midstate[8];
     __local uint l_tail0;
@@ -172,87 +172,77 @@ __kernel void btc_sha256d_scan(
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (uint base = gid * NONCES_PER_THREAD; base < nonce_count; base += gsize * NONCES_PER_THREAD) {
-        #pragma unroll
-        for (uint j = 0u; j < NONCES_PER_THREAD; ++j) {
-            const uint idx = base + j;
-            if (idx >= nonce_count) {
-                break;
-            }
+    const uint nonce = start_nonce + gid;
 
-            const uint nonce = start_nonce + idx;
+    uint s1[8];
+    uint w1[16];
 
-            uint s1[8];
-            uint w1[16];
-
-            #pragma unroll
-            for (uint i = 0u; i < 8u; ++i) {
-                s1[i] = l_midstate[i];
-            }
-
-            w1[0]  = l_tail0;
-            w1[1]  = l_tail1;
-            w1[2]  = l_tail2;
-            w1[3]  = bswap32(nonce);
-            w1[4]  = 0x80000000u;
-            w1[5]  = 0u;
-            w1[6]  = 0u;
-            w1[7]  = 0u;
-            w1[8]  = 0u;
-            w1[9]  = 0u;
-            w1[10] = 0u;
-            w1[11] = 0u;
-            w1[12] = 0u;
-            w1[13] = 0u;
-            w1[14] = 0u;
-            w1[15] = 0x00000280u;
-
-            sha256_compress_16w(s1, w1);
-
-            uint s2[8];
-            uint w2[16];
-
-            sha256_init(s2);
-
-            w2[0]  = s1[0];
-            w2[1]  = s1[1];
-            w2[2]  = s1[2];
-            w2[3]  = s1[3];
-            w2[4]  = s1[4];
-            w2[5]  = s1[5];
-            w2[6]  = s1[6];
-            w2[7]  = s1[7];
-            w2[8]  = 0x80000000u;
-            w2[9]  = 0u;
-            w2[10] = 0u;
-            w2[11] = 0u;
-            w2[12] = 0u;
-            w2[13] = 0u;
-            w2[14] = 0u;
-            w2[15] = 0x00000100u;
-
-            sha256_compress_16w(s2, w2);
-
-            if (!btc_hash_meets_target_from_state(s2, l_target)) {
-                continue;
-            }
-
-            uint slot = atomic_inc((volatile __global uint*)out_count);
-            if (slot >= max_results) {
-                return;
-            }
-
-            out_nonces[slot] = nonce;
-
-            __global uchar* dst = out_hashes32_be + (slot * 32u);
-            write_le32_global(dst +  0u, s2[7]);
-            write_le32_global(dst +  4u, s2[6]);
-            write_le32_global(dst +  8u, s2[5]);
-            write_le32_global(dst + 12u, s2[4]);
-            write_le32_global(dst + 16u, s2[3]);
-            write_le32_global(dst + 20u, s2[2]);
-            write_le32_global(dst + 24u, s2[1]);
-            write_le32_global(dst + 28u, s2[0]);
-        }
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        s1[i] = l_midstate[i];
     }
+
+    w1[0]  = l_tail0;
+    w1[1]  = l_tail1;
+    w1[2]  = l_tail2;
+    w1[3]  = bswap32(nonce);
+    w1[4]  = 0x80000000u;
+    w1[5]  = 0u;
+    w1[6]  = 0u;
+    w1[7]  = 0u;
+    w1[8]  = 0u;
+    w1[9]  = 0u;
+    w1[10] = 0u;
+    w1[11] = 0u;
+    w1[12] = 0u;
+    w1[13] = 0u;
+    w1[14] = 0u;
+    w1[15] = 0x00000280u;
+
+    sha256_compress_16w(s1, w1);
+
+    uint s2[8];
+    uint w2[16];
+
+    sha256_init(s2);
+
+    w2[0]  = s1[0];
+    w2[1]  = s1[1];
+    w2[2]  = s1[2];
+    w2[3]  = s1[3];
+    w2[4]  = s1[4];
+    w2[5]  = s1[5];
+    w2[6]  = s1[6];
+    w2[7]  = s1[7];
+    w2[8]  = 0x80000000u;
+    w2[9]  = 0u;
+    w2[10] = 0u;
+    w2[11] = 0u;
+    w2[12] = 0u;
+    w2[13] = 0u;
+    w2[14] = 0u;
+    w2[15] = 0x00000100u;
+
+    sha256_compress_16w(s2, w2);
+
+    if (!btc_hash_meets_target_from_state(s2, l_target)) {
+        return;
+    }
+
+    uint slot = atomic_inc((volatile __global uint*)out_count);
+    if (slot >= max_results) {
+        return;
+    }
+
+    out_nonces[slot] = nonce;
+
+    __global uchar* dst = out_hashes32_be + (slot * 32u);
+    write_le32_global(dst +  0u, s2[7]);
+    write_le32_global(dst +  4u, s2[6]);
+    write_le32_global(dst +  8u, s2[5]);
+    write_le32_global(dst + 12u, s2[4]);
+    write_le32_global(dst + 16u, s2[3]);
+    write_le32_global(dst + 20u, s2[2]);
+    write_le32_global(dst + 24u, s2[1]);
+    write_le32_global(dst + 28u, s2[0]);
 }

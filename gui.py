@@ -142,13 +142,6 @@ def _is_writable_target(path: Path) -> bool:
         return False
 
 
-def _resolve_load_config_path() -> Optional[Path]:
-    for candidate in _config_load_candidates():
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def _resolve_save_config_path() -> Path:
     for candidate in _config_save_candidates():
         if _is_writable_target(candidate):
@@ -295,7 +288,7 @@ class BitcoinMinerWindow(QMainWindow):
         splitter.addWidget(self.right_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 1180])
+        splitter.setSizes([450, 1180])
 
         outer.addWidget(splitter, 1)
 
@@ -313,7 +306,7 @@ class BitcoinMinerWindow(QMainWindow):
         title = QLabel("Bitcoin Miner Control Panel")
         title.setObjectName("AppTitle")
 
-        subtitle = QLabel("Large log workspace with a compact control bar at the bottom of the settings panel.")
+        subtitle = QLabel("OpenCL, VirtualASIC, native, and python backends with a shared log and overview.")
         subtitle.setObjectName("AppSubtitle")
 
         title_col.addWidget(title)
@@ -467,31 +460,60 @@ class BitcoinMinerWindow(QMainWindow):
         return group
 
     def _build_backend_group(self) -> QWidget:
-        group = QGroupBox("Backend / Native")
+        group = QGroupBox("Backend / Native / VirtualASIC")
         form = QFormLayout(group)
         form.setLabelAlignment(Qt.AlignRight)
         form.setSpacing(10)
 
         self.scan_backend_combo = QComboBox()
-        self.scan_backend_combo.addItems(["opencl", "native", "python", "auto"])
+        self.scan_backend_combo.addItems(["opencl", "virtualasic", "native", "python", "auto"])
 
-        self.verify_opencl_hits_check = QCheckBox("Verify OpenCL GPU hits on CPU/native before submit")
+        self.verify_opencl_hits_check = QCheckBox(
+            "Verify OpenCL/VirtualASIC hits on CPU/native before submit"
+        )
         self.verify_opencl_hits_check.setToolTip(
-            "When enabled, OpenCL hits are rechecked on CPU/native before mining.submit."
+            "When enabled, GPU-style scanner hits are rechecked on CPU/native before mining.submit."
         )
 
         self.native_dll_edit = QLineEdit()
-        dll_row = QHBoxLayout()
-        dll_row.setSpacing(6)
-        dll_row.addWidget(self.native_dll_edit, 1)
+        native_row = QHBoxLayout()
+        native_row.setSpacing(6)
+        native_row.addWidget(self.native_dll_edit, 1)
 
-        dll_browse = QPushButton("Browse")
-        dll_browse.clicked.connect(self._browse_native_dll)
-        dll_row.addWidget(dll_browse)
+        native_browse = QPushButton("Browse")
+        native_browse.clicked.connect(self._browse_native_dll)
+        native_row.addWidget(native_browse)
+
+        self.virtualasic_dll_edit = QLineEdit()
+        vasic_dll_row = QHBoxLayout()
+        vasic_dll_row.setSpacing(6)
+        vasic_dll_row.addWidget(self.virtualasic_dll_edit, 1)
+
+        vasic_dll_browse = QPushButton("Browse")
+        vasic_dll_browse.clicked.connect(self._browse_virtualasic_dll)
+        vasic_dll_row.addWidget(vasic_dll_browse)
+
+        self.virtualasic_kernel_edit = QLineEdit()
+        vasic_kernel_row = QHBoxLayout()
+        vasic_kernel_row.setSpacing(6)
+        vasic_kernel_row.addWidget(self.virtualasic_kernel_edit, 1)
+
+        vasic_kernel_browse = QPushButton("Browse")
+        vasic_kernel_browse.clicked.connect(self._browse_virtualasic_kernel)
+        vasic_kernel_row.addWidget(vasic_kernel_browse)
+
+        self.virtualasic_kernel_name_edit = QLineEdit()
+        self.virtualasic_core_count_spin = QSpinBox()
+        self.virtualasic_core_count_spin.setRange(1, 4096)
 
         form.addRow("Scan backend:", self.scan_backend_combo)
         form.addRow("", self.verify_opencl_hits_check)
-        form.addRow("Native DLL:", self._wrap_layout(dll_row))
+        form.addRow("Native DLL:", self._wrap_layout(native_row))
+        form.addRow("VirtualASIC DLL:", self._wrap_layout(vasic_dll_row))
+        form.addRow("VirtualASIC kernel:", self._wrap_layout(vasic_kernel_row))
+        form.addRow("VirtualASIC kernel name:", self.virtualasic_kernel_name_edit)
+        form.addRow("VirtualASIC cores:", self.virtualasic_core_count_spin)
+
         return group
 
     def _build_opencl_group(self) -> QWidget:
@@ -831,6 +853,10 @@ class BitcoinMinerWindow(QMainWindow):
             use_tls=False,
             scan_backend="opencl",
             native_dll_path=_resolve_resource("", "BitcoinProject.dll"),
+            virtualasic_dll_path=_resolve_resource("", "VirtualASIC.dll"),
+            virtualasic_kernel_path=_resolve_resource("", "btc_sha256d_scan.cl"),
+            virtualasic_kernel_name="btc_sha256d_scan",
+            virtualasic_core_count=128,
             opencl_loader=_resolve_resource("", "OpenCL.dll"),
             kernel_path=_resolve_resource("", "btc_sha256d_scan.cl"),
             build_options="-cl-std=CL1.2",
@@ -887,7 +913,12 @@ class BitcoinMinerWindow(QMainWindow):
 
         self.scan_backend_combo.setCurrentText(cfg.normalized_scan_backend())
         self.verify_opencl_hits_check.setChecked(bool(getattr(cfg, "verify_opencl_hits_before_submit", True)))
+
         self.native_dll_edit.setText(cfg.native_dll_path)
+        self.virtualasic_dll_edit.setText(getattr(cfg, "virtualasic_dll_path", "VirtualASIC.dll"))
+        self.virtualasic_kernel_edit.setText(getattr(cfg, "virtualasic_kernel_path", "btc_sha256d_scan.cl"))
+        self.virtualasic_kernel_name_edit.setText(getattr(cfg, "virtualasic_kernel_name", "btc_sha256d_scan"))
+        self.virtualasic_core_count_spin.setValue(int(getattr(cfg, "virtualasic_core_count", 128)))
 
         self.opencl_loader_edit.setText(cfg.opencl_loader)
         self.kernel_path_edit.setText(cfg.kernel_path)
@@ -906,6 +937,7 @@ class BitcoinMinerWindow(QMainWindow):
 
     def _collect_config(self) -> BtcMinerConfig:
         local_work_size = int(self.local_work_size_spin.value())
+
         return BtcMinerConfig(
             host=self.host_edit.text().strip(),
             port=int(self.port_spin.value()),
@@ -915,6 +947,10 @@ class BitcoinMinerWindow(QMainWindow):
             use_tls=self.use_tls_check.isChecked(),
             scan_backend=self.scan_backend_combo.currentText(),
             native_dll_path=self.native_dll_edit.text().strip(),
+            virtualasic_dll_path=self.virtualasic_dll_edit.text().strip(),
+            virtualasic_kernel_path=self.virtualasic_kernel_edit.text().strip(),
+            virtualasic_kernel_name=self.virtualasic_kernel_name_edit.text().strip() or "btc_sha256d_scan",
+            virtualasic_core_count=int(self.virtualasic_core_count_spin.value()),
             opencl_loader=self.opencl_loader_edit.text().strip(),
             kernel_path=self.kernel_path_edit.text().strip(),
             build_options=self.build_options_edit.text().strip(),
@@ -936,9 +972,12 @@ class BitcoinMinerWindow(QMainWindow):
 
         try:
             devices = OpenCLSha256dScanner.list_devices()
-            for item in devices:
-                label = f"P{item.platform_index}/D{item.device_index} - {item.platform_name} / {item.device_name}"
-                self.device_combo.addItem(label, (item.platform_index, item.device_index))
+            if not devices:
+                self.device_combo.addItem("No OpenCL devices found", (-1, -1))
+            else:
+                for item in devices:
+                    label = f"P{item.platform_index}/D{item.device_index} - {item.platform_name} / {item.device_name}"
+                    self.device_combo.addItem(label, (item.platform_index, item.device_index))
         except Exception as exc:
             self.device_combo.addItem("OpenCL device enumeration failed", (-1, -1))
             if not initial:
@@ -960,6 +999,7 @@ class BitcoinMinerWindow(QMainWindow):
         data = self.device_combo.itemData(index)
         if not isinstance(data, tuple) or len(data) != 2:
             return
+
         platform_index, device_index = data
         if platform_index >= 0:
             self.platform_spin.setValue(int(platform_index))
@@ -1092,15 +1132,16 @@ class BitcoinMinerWindow(QMainWindow):
 
     def _parse_log_for_cards(self, line: str) -> None:
         m_scanner = re.search(
-            r"\[worker\]\s+scanner=([^\s]+)(?:\s+verify_opencl_hits_before_submit=(on|off))?",
+            r"\[worker\]\s+scanner=([^\s]+)(?:\s+verify_gpu_hits_before_submit=(on|off)|\s+verify_opencl_hits_before_submit=(on|off))?",
             line,
         )
         if m_scanner:
-            scanner_name = m_scanner.group(1).strip()
-            verify_mode = (m_scanner.group(2) or "").strip().lower()
+            scanner_name = (m_scanner.group(1) or "").strip()
+            verify_mode = (m_scanner.group(2) or m_scanner.group(3) or "").strip().lower()
 
-            self.backend_card.set_value(scanner_name)
-            self.side_scanner_value.setText(scanner_name)
+            if scanner_name:
+                self.backend_card.set_value(scanner_name)
+                self.side_scanner_value.setText(scanner_name)
 
             if verify_mode in {"on", "off"}:
                 self.side_verify_value.setText(verify_mode)
@@ -1140,6 +1181,26 @@ class BitcoinMinerWindow(QMainWindow):
         )
         if path:
             self.native_dll_edit.setText(path)
+
+    def _browse_virtualasic_dll(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualASIC DLL",
+            self.virtualasic_dll_edit.text().strip() or str(_exe_dir()),
+            "DLL Files (*.dll);;All Files (*)",
+        )
+        if path:
+            self.virtualasic_dll_edit.setText(path)
+
+    def _browse_virtualasic_kernel(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualASIC Kernel",
+            self.virtualasic_kernel_edit.text().strip() or str(_exe_dir()),
+            "OpenCL Files (*.cl);;All Files (*)",
+        )
+        if path:
+            self.virtualasic_kernel_edit.setText(path)
 
     def _browse_kernel(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
