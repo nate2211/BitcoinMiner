@@ -23,6 +23,7 @@ class _StatsSnapshot:
     verify_failed: int = 0
     verified_before_submit: int = 0
     stale_skipped: int = 0
+    duplicate_skipped: int = 0
 
 
 class _HashrateTracker:
@@ -84,6 +85,17 @@ class BitcoinMinerWorker:
         self._hashrate = _HashrateTracker(window_s=float(self.config.stats_window_s))
         self._last_stats_log_at = 0.0
 
+        self._recent_submit_ttl_s = max(
+            30.0,
+            float(getattr(self.config, "recent_submit_ttl_s", 900.0)),
+        )
+        self._recent_submit_limit = max(
+            1024,
+            int(getattr(self.config, "recent_submit_limit", 65536)),
+        )
+        self._recent_submit_seen: dict[str, float] = {}
+        self._recent_submit_order: collections.deque[tuple[float, str]] = collections.deque()
+
         self.native = BitcoinNativeBridge(self.config.native_dll_path, self.on_log)
 
         self.client = BitcoinStratumConnection(
@@ -97,13 +109,22 @@ class BitcoinMinerWorker:
         self._scanner_kind = "python"
         self.scanner = self._make_scanner()
 
-        verify_mode = "on" if self._should_verify_gpu_hits() else "off"
+        verify_mode = "on" if self._should_verify_hits_before_submit() else "off"
         self.on_log(
-            f"[worker] scanner={self._scanner_kind} verify_gpu_hits_before_submit={verify_mode}"
+            f"[worker] scanner={self._scanner_kind} verify_hits_before_submit={verify_mode}"
         )
 
     def _make_scanner(self):
         backend = self.config.normalized_scan_backend()
+
+        if backend == "virtualasic":
+            try:
+                scanner = VirtualAsicSha256dScanner(self.config, self.on_log)
+                scanner.initialize()
+                self._scanner_kind = "virtualasic"
+                return scanner
+            except Exception as exc:
+                self.on_log(f"[worker] virtualasic unavailable: {exc}")
 
         if backend in {"opencl", "auto"}:
             try:
@@ -129,13 +150,16 @@ class BitcoinMinerWorker:
             self._scanner_kind = "native"
             return scanner
 
-        scanner = CpuExactSha256dScanner(self.on_log, native=self.native if self.native.available else None)
+        scanner = CpuExactSha256dScanner(
+            self.on_log,
+            native=self.native if self.native.available else None,
+        )
         scanner.initialize()
         self._scanner_kind = "python"
         return scanner
 
-    def _should_verify_gpu_hits(self) -> bool:
-        return self._scanner_kind in {"opencl", "virtualasic"} and bool(self.config.verify_opencl_hits_before_submit)
+    def _should_verify_hits_before_submit(self) -> bool:
+        return True
 
     def stop(self) -> None:
         self._stop.set()
@@ -181,20 +205,33 @@ class BitcoinMinerWorker:
                     next_host = self.config.host
                     next_port = int(self.config.port)
                     sleep_s = backoff
-                    backoff = min(float(self.config.reconnect_max_delay_s), max(backoff * 2.0, 1.0))
+                    backoff = min(
+                        float(self.config.reconnect_max_delay_s),
+                        max(backoff * 2.0, 1.0),
+                    )
 
                 self.on_status("reconnecting")
-                time.sleep(sleep_s)
+                self._stop.wait(sleep_s)
         finally:
             try:
+                self.client.close()
+            except Exception:
+                pass
+            try:
                 self.scanner.close()
+            except Exception:
+                pass
+            try:
+                self.native.close()
             except Exception:
                 pass
 
     def _session_loop(self) -> None:
         while not self._stop.is_set():
             if not self.client.alive:
-                raise RuntimeError(f"stratum connection lost: {self.client.fatal_error or 'disconnected'}")
+                raise RuntimeError(
+                    f"stratum connection lost: {self.client.fatal_error or 'disconnected'}"
+                )
 
             idle_reconnect_s = float(self.config.idle_reconnect_s)
             if idle_reconnect_s > 0.0 and self.client.seconds_since_recv() > idle_reconnect_s:
@@ -204,7 +241,7 @@ class BitcoinMinerWorker:
 
             if job is None:
                 self._maybe_log_stats()
-                time.sleep(float(self.config.idle_sleep_s))
+                self._stop.wait(float(self.config.idle_sleep_s))
                 continue
 
             if work is None:
@@ -218,7 +255,9 @@ class BitcoinMinerWorker:
                 if start_nonce + count >= 0x100000000:
                     self._prepared_work = None
                     self._nonce_cursor = 0
-                    self.on_log(f"[worker] nonce space exhausted for job={job.job_id}; rolling extranonce2")
+                    self.on_log(
+                        f"[worker] nonce space exhausted for job={job.job_id}; rolling extranonce2"
+                    )
                     continue
                 self._nonce_cursor += count
 
@@ -241,36 +280,57 @@ class BitcoinMinerWorker:
             if not found:
                 continue
 
-            verify_before_submit = self._should_verify_gpu_hits()
-
             for share in found:
                 if self._is_stale_share(share.job_id):
                     self._stats.stale_skipped += 1
                     self.on_log(
                         f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} "
-                        f"reason=current job changed"
+                        f"reason=current job changed before verify"
+                    )
+                    continue
+
+                submit_key = self._share_submit_key(share, work)
+                if self._was_recently_submitted(submit_key):
+                    self._stats.duplicate_skipped += 1
+                    self.on_log(
+                        f"[submit] duplicate-skip job={share.job_id} nonce={share.nonce:08x}"
                     )
                     continue
 
                 final_hash_hex = (share.header_hash_hex or "").strip().lower()
 
-                if verify_before_submit:
+                if self._should_verify_hits_before_submit():
                     verified_hash_hex, verify_note = self._verify_share_exact(work, share)
                     if not verified_hash_hex:
                         self._stats.verify_failed += 1
                         self.on_log(
                             f"[submit] verify-failed job={share.job_id} nonce={share.nonce:08x} "
-                            f"reason=exact cpu/native recheck did not meet share target"
+                            f"reason=exact local rehash did not meet share target"
                         )
                         continue
 
                     self._stats.verified_before_submit += 1
                     final_hash_hex = verified_hash_hex
 
+                    try:
+                        share.header_hash_hex = verified_hash_hex
+                    except Exception:
+                        pass
+
                     if verify_note:
                         self.on_log(
                             f"[verify] job={share.job_id} nonce={share.nonce:08x} note={verify_note}"
                         )
+
+                if self._is_stale_share(share.job_id):
+                    self._stats.stale_skipped += 1
+                    self.on_log(
+                        f"[submit] stale-skip job={share.job_id} nonce={share.nonce:08x} "
+                        f"reason=current job changed before submit"
+                    )
+                    continue
+
+                self._remember_submitted(submit_key)
 
                 result = self.client.submit(share)
                 if result.accepted:
@@ -288,12 +348,39 @@ class BitcoinMinerWorker:
                         f"error={result.error or result.status}"
                     )
 
+    def _job_signature(self, job: Optional[BtcStratumJob]) -> tuple:
+        if job is None:
+            return ()
+        branches = getattr(job, "merkle_branches_hex", None)
+        if isinstance(branches, list):
+            branches = tuple(branches)
+        return (
+            getattr(job, "job_id", None),
+            bool(getattr(job, "clean_jobs", False)),
+            getattr(job, "prevhash_hex", None),
+            getattr(job, "coinb1_hex", None),
+            getattr(job, "coinb2_hex", None),
+            branches,
+            getattr(job, "version_hex", None),
+            getattr(job, "nbits_hex", None),
+            getattr(job, "ntime_hex", None),
+            getattr(job, "share_target_hex", None),
+        )
+
     def _on_job(self, job: BtcStratumJob) -> None:
         with self._job_lock:
-            if job.clean_jobs:
+            prev_job = self._current_job
+            must_reset = (
+                prev_job is None
+                or bool(getattr(job, "clean_jobs", False))
+                or self._job_signature(prev_job) != self._job_signature(job)
+            )
+
+            if must_reset:
                 self._prepared_work = None
                 self._nonce_cursor = 0
                 self._extranonce2_counter = 0
+
             self._current_job = job
 
         self.on_log(
@@ -314,14 +401,17 @@ class BitcoinMinerWorker:
 
     def _prepare_next_work(self, job: BtcStratumJob) -> PreparedWork:
         extranonce1 = self.client.session.extranonce1_hex
-        extranonce2_size = int(self.client.session.extranonce2_size)
+        extranonce2_size = max(0, int(self.client.session.extranonce2_size))
 
-        if not extranonce1 or extranonce2_size <= 0:
-            raise RuntimeError("Stratum session is missing extranonce state")
+        if extranonce1 is None:
+            raise RuntimeError("Stratum session is missing extranonce1 state")
 
-        max_value = 1 << (8 * extranonce2_size)
-        value = self._extranonce2_counter % max_value
-        extranonce2_hex = value.to_bytes(extranonce2_size, "big", signed=False).hex()
+        if extranonce2_size == 0:
+            extranonce2_hex = ""
+        else:
+            max_value = 1 << (8 * extranonce2_size)
+            value = self._extranonce2_counter % max_value
+            extranonce2_hex = value.to_bytes(extranonce2_size, "big", signed=False).hex()
 
         work = prepare_work(
             job=job,
@@ -346,24 +436,68 @@ class BitcoinMinerWorker:
             current_job_id = self._current_job.job_id if self._current_job is not None else None
         return current_job_id != share_job_id
 
+    def _share_submit_key(self, share: CandidateShare, work: PreparedWork) -> str:
+        nonce = int(getattr(share, "nonce", 0)) & 0xFFFFFFFF
+        job_id = str(getattr(share, "job_id", "") or "")
+        extranonce2_hex = str(
+            getattr(share, "extranonce2_hex", getattr(work, "extranonce2_hex", "")) or ""
+        ).lower()
+        ntime_hex = str(getattr(share, "ntime_hex", "") or "").lower()
+        return f"{job_id}|{extranonce2_hex}|{ntime_hex}|{nonce:08x}"
+
+    def _prune_recent_submits(self, now: Optional[float] = None) -> None:
+        ts = time.time() if now is None else float(now)
+        cutoff = ts - self._recent_submit_ttl_s
+
+        while self._recent_submit_order:
+            oldest_ts, oldest_key = self._recent_submit_order[0]
+            if oldest_ts >= cutoff and len(self._recent_submit_seen) <= self._recent_submit_limit:
+                break
+            self._recent_submit_order.popleft()
+            current_ts = self._recent_submit_seen.get(oldest_key)
+            if current_ts is not None and current_ts <= oldest_ts:
+                self._recent_submit_seen.pop(oldest_key, None)
+
+        while len(self._recent_submit_seen) > self._recent_submit_limit and self._recent_submit_order:
+            _, oldest_key = self._recent_submit_order.popleft()
+            self._recent_submit_seen.pop(oldest_key, None)
+
+    def _was_recently_submitted(self, key: str) -> bool:
+        now = time.time()
+        self._prune_recent_submits(now)
+        ts = self._recent_submit_seen.get(key)
+        return ts is not None and (now - ts) <= self._recent_submit_ttl_s
+
+    def _remember_submitted(self, key: str) -> None:
+        now = time.time()
+        self._recent_submit_seen[key] = now
+        self._recent_submit_order.append((now, key))
+        self._prune_recent_submits(now)
+
     def _verify_share_exact(self, work: PreparedWork, share: CandidateShare) -> tuple[str, str]:
-        header80 = build_header80(work.header_prefix76, share.nonce)
+        try:
+            header80 = build_header80(work.header_prefix76, share.nonce)
 
-        if self.native is not None and self.native.available:
-            raw_hash = self.native.sha256d_header80(header80)
-        else:
-            raw_hash = dbl_sha256(header80)
+            if self.native is not None and self.native.available:
+                raw_hash = self.native.sha256d_header80(header80)
+            else:
+                raw_hash = dbl_sha256(header80)
 
-        if not hash_meets_target(raw_hash, work.share_target_int):
-            return "", ""
+            if not hash_meets_target(raw_hash, work.share_target_int):
+                return "", ""
 
-        exact_hash_hex = hash_to_display_hex(raw_hash)
-        gpu_hash_hex = (share.header_hash_hex or "").strip().lower()
+            exact_hash_hex = hash_to_display_hex(raw_hash)
+            gpu_hash_hex = (share.header_hash_hex or "").strip().lower()
 
-        if gpu_hash_hex and gpu_hash_hex != exact_hash_hex:
-            return exact_hash_hex, f"gpu/cpu hash mismatch gpu={gpu_hash_hex} cpu={exact_hash_hex}; using cpu/native result"
+            if gpu_hash_hex and gpu_hash_hex != exact_hash_hex:
+                return (
+                    exact_hash_hex,
+                    f"scanner/local hash mismatch scanner={gpu_hash_hex} local={exact_hash_hex}; using local result",
+                )
 
-        return exact_hash_hex, ""
+            return exact_hash_hex, ""
+        except Exception as exc:
+            return "", f"verify exception: {exc}"
 
     def _maybe_log_stats(self, inst_hs: Optional[float] = None) -> None:
         now = time.time()
@@ -385,5 +519,6 @@ class BitcoinMinerWorker:
             f"errors={self._stats.errors} "
             f"verified={self._stats.verified_before_submit} "
             f"verify_failed={self._stats.verify_failed} "
-            f"stale={self._stats.stale_skipped}"
+            f"stale={self._stats.stale_skipped} "
+            f"duplicates={self._stats.duplicate_skipped}"
         )

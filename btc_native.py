@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 from typing import Callable, Optional
 
 
@@ -90,6 +91,7 @@ class BitcoinNativeBridge:
         self.available = False
         self.load_error = ""
         self._dll_dir_handles: list[object] = []
+        self._call_lock = threading.Lock()
 
         try:
             self.dll_path = _resolve_existing_path(dll_path, "BitcoinProject.dll")
@@ -161,11 +163,25 @@ class BitcoinNativeBridge:
         in_arr = (ctypes.c_ubyte * 80).from_buffer_copy(header80)
         out_arr = (ctypes.c_ubyte * 32)()
 
-        rc = self.lib.btc_sha256d_header80(in_arr, out_arr)
+        with self._call_lock:
+            rc = self.lib.btc_sha256d_header80(in_arr, out_arr)
+
         if rc != 0:
             raise RuntimeError(f"btc_sha256d_header80 failed: rc={rc}")
 
         return bytes(out_arr)
+
+    def sha256d_many_header80(self, headers80: list[bytes]) -> list[bytes]:
+        out: list[bytes] = []
+        for header80 in headers80:
+            out.append(self.sha256d_header80(header80))
+        return out
+
+    def sha256d_prefix76_nonce(self, prefix76: bytes, nonce: int) -> bytes:
+        if len(prefix76) != 76:
+            raise ValueError("prefix76 must be exactly 76 bytes")
+        nonce_le = int(nonce & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
+        return self.sha256d_header80(prefix76 + nonce_le)
 
     def scan_prefix76(
         self,
@@ -191,16 +207,18 @@ class BitcoinNativeBridge:
         out_hashes = (ctypes.c_ubyte * (max_results * 32))()
         out_count = ctypes.c_uint32(0)
 
-        rc = self.lib.btc_scan_prefix76(
-            prefix_arr,
-            ctypes.c_uint32(int(start_nonce) & 0xFFFFFFFF),
-            ctypes.c_uint32(max(0, int(count))),
-            target_arr,
-            ctypes.c_uint32(max_results),
-            out_nonces,
-            out_hashes,
-            ctypes.byref(out_count),
-        )
+        with self._call_lock:
+            rc = self.lib.btc_scan_prefix76(
+                prefix_arr,
+                ctypes.c_uint32(int(start_nonce) & 0xFFFFFFFF),
+                ctypes.c_uint32(max(0, int(count))),
+                target_arr,
+                ctypes.c_uint32(max_results),
+                out_nonces,
+                out_hashes,
+                ctypes.byref(out_count),
+            )
+
         if rc != 0:
             raise RuntimeError(f"btc_scan_prefix76 failed: rc={rc}")
 
