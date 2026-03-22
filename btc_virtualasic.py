@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import sys
+import threading
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from btc_models import BtcMinerConfig, CandidateShare, PreparedWork
@@ -83,9 +86,89 @@ def _resolve_existing_path(path: str, default_name: str) -> str:
     )
 
 
+def _align_up(value: int, align: int) -> int:
+    value = int(value)
+    align = max(1, int(align))
+    return ((value + align - 1) // align) * align
+
+
+@dataclass
+class VirtualAsicKernelAnnotations:
+    candidate_merge_mode: bool = False
+    count_arg_index: int = -1
+    merge_buffers: list[tuple[int, int]] = field(default_factory=list)
+    partition_mode: str = ""
+    partition_scalar_arg_index: int = -1
+
+    def summary(self) -> str:
+        merge_text = ",".join(f"{arg}:{size}" for arg, size in self.merge_buffers) or "-"
+        part = self.partition_mode or "-"
+        if self.partition_scalar_arg_index >= 0 and not part.endswith(f":{self.partition_scalar_arg_index}"):
+            part = f"{part}:{self.partition_scalar_arg_index}"
+        return (
+            f"candidate_merge={'on' if self.candidate_merge_mode else 'off'} "
+            f"count_arg={self.count_arg_index if self.count_arg_index >= 0 else '-'} "
+            f"merge_buffers={merge_text} "
+            f"partition={part}"
+        )
+
+
+def _parse_kernel_annotations(kernel_path: str) -> VirtualAsicKernelAnnotations:
+    meta = VirtualAsicKernelAnnotations()
+
+    try:
+        with open(kernel_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if "@vasic_" not in line:
+                    continue
+
+                pos = line.find("@vasic_")
+                cmd = line[pos + len("@vasic_"):].strip()
+
+                if cmd.startswith("mode"):
+                    value = cmd[len("mode"):].strip()
+                    if value == "candidate_merge":
+                        meta.candidate_merge_mode = True
+
+                elif cmd.startswith("count_arg"):
+                    value = cmd[len("count_arg"):].strip()
+                    try:
+                        meta.count_arg_index = int(value, 10)
+                    except Exception:
+                        pass
+
+                elif cmd.startswith("merge_buffer"):
+                    value = cmd[len("merge_buffer"):].strip()
+                    if ":" in value:
+                        left, right = value.split(":", 1)
+                        try:
+                            meta.merge_buffers.append((int(left.strip(), 10), int(right.strip(), 10)))
+                        except Exception:
+                            pass
+
+                elif cmd.startswith("partition"):
+                    value = cmd[len("partition"):].strip()
+                    meta.partition_mode = value
+                    if value.startswith("scalar_u32:"):
+                        try:
+                            meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
+                        except Exception:
+                            pass
+                    elif value.startswith("global_offset+scalar_u32:"):
+                        try:
+                            meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    return meta
+
+
 class BitcoinVirtualAsicBridge:
     """
-    Expected VirtualASIC DLL exports:
+    Required VirtualASIC DLL exports:
 
         vasic_create_ex(uint32_t core_count) -> void*
         vasic_destroy(void*)
@@ -126,14 +209,76 @@ class BitcoinVirtualAsicBridge:
         self.available = False
         self.load_error = ""
         self._dll_dir_handles: list[object] = []
+        self._call_lock = threading.Lock()
 
         try:
             self.dll_path = _resolve_existing_path(dll_path, "VirtualASIC.dll")
             self.kernel_path = _resolve_existing_path(kernel_path, "btc_sha256d_scan.cl")
             self._prepare_dll_search_dirs(self.dll_path)
 
-            self.lib = ctypes.CDLL(self.dll_path)
-            self._bind()
+            if os.name == "nt":
+                self.lib = ctypes.WinDLL(self.dll_path)
+            else:
+                self.lib = ctypes.CDLL(self.dll_path)
+
+            self.lib.vasic_create_ex.argtypes = [ctypes.c_uint32]
+            self.lib.vasic_create_ex.restype = ctypes.c_void_p
+
+            self.lib.vasic_destroy.argtypes = [ctypes.c_void_p]
+            self.lib.vasic_destroy.restype = None
+
+            self.lib.vasic_copy_last_error.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            self.lib.vasic_copy_last_error.restype = ctypes.c_int
+
+            self.lib.vasic_create_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self.lib.vasic_create_buffer.restype = ctypes.c_uint32
+
+            self.lib.vasic_release_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self.lib.vasic_release_buffer.restype = ctypes.c_int
+
+            self.lib.vasic_write_buffer.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self.lib.vasic_write_buffer.restype = ctypes.c_int
+
+            self.lib.vasic_read_buffer.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self.lib.vasic_read_buffer.restype = ctypes.c_int
+
+            self.lib.vasic_load_kernel_file.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            self.lib.vasic_load_kernel_file.restype = ctypes.c_uint32
+
+            self.lib.vasic_release_kernel.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self.lib.vasic_release_kernel.restype = ctypes.c_int
+
+            self.lib.vasic_set_kernel_arg_buffer.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            self.lib.vasic_set_kernel_arg_buffer.restype = ctypes.c_int
+
+            self.lib.vasic_set_kernel_arg_u32.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            self.lib.vasic_set_kernel_arg_u32.restype = ctypes.c_int
+
+            self.lib.vasic_enqueue_ndrange.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+            self.lib.vasic_enqueue_ndrange.restype = ctypes.c_int
+
             self.available = True
             self.on_log(f"[virtualasic] loaded {self.dll_path}")
         except Exception as exc:
@@ -168,79 +313,20 @@ class BitcoinVirtualAsicBridge:
             except Exception:
                 pass
 
-    def _bind(self) -> None:
-        assert self.lib is not None
-
-        self.lib.vasic_create_ex.argtypes = [ctypes.c_uint32]
-        self.lib.vasic_create_ex.restype = ctypes.c_void_p
-
-        self.lib.vasic_destroy.argtypes = [ctypes.c_void_p]
-        self.lib.vasic_destroy.restype = None
-
-        self.lib.vasic_copy_last_error.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
-        self.lib.vasic_copy_last_error.restype = ctypes.c_int
-
-        self.lib.vasic_create_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        self.lib.vasic_create_buffer.restype = ctypes.c_uint32
-
-        self.lib.vasic_release_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        self.lib.vasic_release_buffer.restype = ctypes.c_int
-
-        self.lib.vasic_write_buffer.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        self.lib.vasic_write_buffer.restype = ctypes.c_int
-
-        self.lib.vasic_read_buffer.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        self.lib.vasic_read_buffer.restype = ctypes.c_int
-
-        self.lib.vasic_load_kernel_file.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-        self.lib.vasic_load_kernel_file.restype = ctypes.c_uint32
-
-        self.lib.vasic_release_kernel.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        self.lib.vasic_release_kernel.restype = ctypes.c_int
-
-        self.lib.vasic_set_kernel_arg_buffer.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-        ]
-        self.lib.vasic_set_kernel_arg_buffer.restype = ctypes.c_int
-
-        self.lib.vasic_set_kernel_arg_u32.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-        ]
-        self.lib.vasic_set_kernel_arg_u32.restype = ctypes.c_int
-
-        self.lib.vasic_enqueue_ndrange.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
-        self.lib.vasic_enqueue_ndrange.restype = ctypes.c_int
-
     def initialize(self) -> None:
         if not self.available or self.lib is None:
             raise RuntimeError("VirtualASIC DLL is not available")
 
-        self.engine = self.lib.vasic_create_ex(ctypes.c_uint32(self.core_count))
+        with self._call_lock:
+            self.engine = self.lib.vasic_create_ex(ctypes.c_uint32(self.core_count))
         if not self.engine:
             raise RuntimeError("vasic_create_ex failed")
 
         kernel_name_b = self.kernel_name.encode("utf-8") if self.kernel_name else None
         kernel_path_b = self.kernel_path.encode("utf-8")
 
-        self.kernel_id = int(self.lib.vasic_load_kernel_file(self.engine, kernel_name_b, kernel_path_b))
+        with self._call_lock:
+            self.kernel_id = int(self.lib.vasic_load_kernel_file(self.engine, kernel_name_b, kernel_path_b))
         if not self.kernel_id:
             err = self.last_error()
             self.close()
@@ -255,7 +341,8 @@ class BitcoinVirtualAsicBridge:
         try:
             if self.lib is not None and self.engine and self.kernel_id:
                 try:
-                    self.lib.vasic_release_kernel(self.engine, ctypes.c_uint32(self.kernel_id))
+                    with self._call_lock:
+                        self.lib.vasic_release_kernel(self.engine, ctypes.c_uint32(self.kernel_id))
                 except Exception:
                     pass
         finally:
@@ -263,11 +350,11 @@ class BitcoinVirtualAsicBridge:
 
         if self.lib is not None and self.engine:
             try:
-                self.lib.vasic_destroy(self.engine)
+                with self._call_lock:
+                    self.lib.vasic_destroy(self.engine)
             except Exception:
                 pass
         self.engine = None
-        self.lib = self.lib
 
         for handle in self._dll_dir_handles:
             try:
@@ -282,7 +369,8 @@ class BitcoinVirtualAsicBridge:
 
         buf = ctypes.create_string_buffer(4096)
         try:
-            self.lib.vasic_copy_last_error(self.engine, buf, ctypes.c_uint32(len(buf)))
+            with self._call_lock:
+                self.lib.vasic_copy_last_error(self.engine, buf, ctypes.c_uint32(len(buf)))
             text = buf.value.decode("utf-8", errors="replace").strip()
             return text or "unknown error"
         except Exception:
@@ -295,7 +383,8 @@ class BitcoinVirtualAsicBridge:
     def create_buffer(self, size_bytes: int) -> int:
         if self.lib is None or not self.engine:
             raise RuntimeError("VirtualASIC engine is not initialized")
-        bid = int(self.lib.vasic_create_buffer(self.engine, ctypes.c_uint32(int(size_bytes))))
+        with self._call_lock:
+            bid = int(self.lib.vasic_create_buffer(self.engine, ctypes.c_uint32(int(size_bytes))))
         if bid == 0:
             raise RuntimeError(f"vasic_create_buffer failed: {self.last_error()}")
         return bid
@@ -303,8 +392,10 @@ class BitcoinVirtualAsicBridge:
     def release_buffer(self, buffer_id: int) -> None:
         if self.lib is None or not self.engine or not buffer_id:
             return
+        with self._call_lock:
+            ok = self.lib.vasic_release_buffer(self.engine, ctypes.c_uint32(int(buffer_id)))
         self._check(
-            self.lib.vasic_release_buffer(self.engine, ctypes.c_uint32(int(buffer_id))),
+            ok,
             f"vasic_release_buffer(buffer_id={buffer_id})",
         )
 
@@ -313,14 +404,16 @@ class BitcoinVirtualAsicBridge:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
         src = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
-        self._check(
-            self.lib.vasic_write_buffer(
+        with self._call_lock:
+            ok = self.lib.vasic_write_buffer(
                 self.engine,
                 ctypes.c_uint32(int(buffer_id)),
                 ctypes.c_uint32(int(offset)),
                 src,
                 ctypes.c_uint32(len(data)),
-            ),
+            )
+        self._check(
+            ok,
             f"vasic_write_buffer(buffer_id={buffer_id}, size={len(data)}, offset={offset})",
         )
 
@@ -329,14 +422,16 @@ class BitcoinVirtualAsicBridge:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
         dst = (ctypes.c_ubyte * int(size_bytes))()
-        self._check(
-            self.lib.vasic_read_buffer(
+        with self._call_lock:
+            ok = self.lib.vasic_read_buffer(
                 self.engine,
                 ctypes.c_uint32(int(buffer_id)),
                 ctypes.c_uint32(int(offset)),
                 dst,
                 ctypes.c_uint32(int(size_bytes)),
-            ),
+            )
+        self._check(
+            ok,
             f"vasic_read_buffer(buffer_id={buffer_id}, size={size_bytes}, offset={offset})",
         )
         return bytes(dst)
@@ -345,13 +440,15 @@ class BitcoinVirtualAsicBridge:
         if self.lib is None or not self.engine or not self.kernel_id:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
-        self._check(
-            self.lib.vasic_set_kernel_arg_buffer(
+        with self._call_lock:
+            ok = self.lib.vasic_set_kernel_arg_buffer(
                 self.engine,
                 ctypes.c_uint32(self.kernel_id),
                 ctypes.c_uint32(int(arg_index)),
                 ctypes.c_uint32(int(buffer_id)),
-            ),
+            )
+        self._check(
+            ok,
             f"vasic_set_kernel_arg_buffer(arg_index={arg_index}, buffer_id={buffer_id})",
         )
 
@@ -359,13 +456,15 @@ class BitcoinVirtualAsicBridge:
         if self.lib is None or not self.engine or not self.kernel_id:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
-        self._check(
-            self.lib.vasic_set_kernel_arg_u32(
+        with self._call_lock:
+            ok = self.lib.vasic_set_kernel_arg_u32(
                 self.engine,
                 ctypes.c_uint32(self.kernel_id),
                 ctypes.c_uint32(int(arg_index)),
                 ctypes.c_uint32(int(value) & 0xFFFFFFFF),
-            ),
+            )
+        self._check(
+            ok,
             f"vasic_set_kernel_arg_u32(arg_index={arg_index}, value={int(value) & 0xFFFFFFFF})",
         )
 
@@ -373,12 +472,14 @@ class BitcoinVirtualAsicBridge:
         if self.lib is None or not self.engine or not self.kernel_id:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
-        self._check(
-            self.lib.vasic_enqueue_ndrange(
+        with self._call_lock:
+            ok = self.lib.vasic_enqueue_ndrange(
                 self.engine,
                 ctypes.c_uint32(self.kernel_id),
                 ctypes.c_uint32(int(global_size)),
-            ),
+            )
+        self._check(
+            ok,
             f"vasic_enqueue_ndrange(global_size={global_size})",
         )
 
@@ -395,7 +496,10 @@ class VirtualAsicSha256dScanner:
         arg 5: u32    start_nonce
         arg 6: u32    max_results
 
-    global_size passed to enqueue_ndrange == nonce count for the scan window.
+    This rewrite activates CPU-lane-friendly behavior without changing the DLL by:
+      - reading kernel annotations
+      - using a larger launch window for candidate_merge kernels
+      - caching the overscanned nonce range so later worker calls do not overlap
     """
 
     ARG_PREFIX76 = 0
@@ -411,12 +515,24 @@ class VirtualAsicSha256dScanner:
         self.on_log = on_log
 
         self.bridge: Optional[BitcoinVirtualAsicBridge] = None
+        self.annotations = VirtualAsicKernelAnnotations()
+
         self._prefix_buf = 0
         self._target_buf = 0
         self._out_nonces_buf = 0
         self._out_hashes_buf = 0
         self._out_count_buf = 0
         self._out_capacity = 0
+
+        self._hybrid_force_enable = bool(getattr(self.config, "virtualasic_force_cpu_lane", True))
+        self._hybrid_min_launch = max(1, int(getattr(self.config, "virtualasic_hybrid_min_launch", 8192)))
+        self._hybrid_align = max(1, int(getattr(self.config, "virtualasic_hybrid_align", 256)))
+        self._hybrid_max_results_cap = max(1, int(getattr(self.config, "virtualasic_hybrid_max_results_cap", 4096)))
+
+        self._cache_work_key: Optional[tuple] = None
+        self._cache_range_start: int = 0
+        self._cache_range_end: int = 0
+        self._cache_hits: list[CandidateShare] = []
 
     def initialize(self) -> None:
         self.bridge = BitcoinVirtualAsicBridge(
@@ -429,6 +545,9 @@ class VirtualAsicSha256dScanner:
         if not self.bridge.available:
             raise RuntimeError("VirtualASIC DLL could not be loaded")
 
+        self.annotations = _parse_kernel_annotations(self.bridge.kernel_path)
+        self.on_log(f"[virtualasic] kernel annotations {self.annotations.summary()}")
+
         self.bridge.initialize()
 
         self._prefix_buf = self.bridge.create_buffer(76)
@@ -437,12 +556,22 @@ class VirtualAsicSha256dScanner:
         self.bridge.set_arg_buffer(self.ARG_PREFIX76, self._prefix_buf)
         self.bridge.set_arg_buffer(self.ARG_TARGET32, self._target_buf)
 
+        if self._is_hybrid_candidate_merge_kernel():
+            self.on_log(
+                f"[virtualasic] cpu-lane assist enabled "
+                f"min_launch={self._hybrid_min_launch} align={self._hybrid_align}"
+            )
+        else:
+            self.on_log("[virtualasic] cpu-lane assist disabled for this kernel")
+
         self.on_log(
             f"[virtualasic] ready kernel={self.config.virtualasic_kernel_name or '(file-defined)'} "
             f"cores={self.config.virtualasic_core_count}"
         )
 
     def close(self) -> None:
+        self._clear_cache()
+
         if self.bridge is None:
             return
 
@@ -471,12 +600,54 @@ class VirtualAsicSha256dScanner:
         finally:
             self.bridge = None
 
+    def _clear_cache(self) -> None:
+        self._cache_work_key = None
+        self._cache_range_start = 0
+        self._cache_range_end = 0
+        self._cache_hits = []
+
+    def _work_key(self, work: PreparedWork) -> tuple:
+        return (
+            work.job_id,
+            work.extranonce2_hex,
+            work.ntime_hex,
+            bytes(work.header_prefix76),
+            bytes(work.share_target_bytes_be),
+        )
+
+    def _is_hybrid_candidate_merge_kernel(self) -> bool:
+        if not self._hybrid_force_enable:
+            return False
+        if not self.annotations.candidate_merge_mode:
+            return False
+        if self.annotations.count_arg_index != self.ARG_OUT_COUNT:
+            return False
+
+        merge_map = {(arg, size) for arg, size in self.annotations.merge_buffers}
+        expected = {
+            (self.ARG_OUT_NONCES, 4),
+            (self.ARG_OUT_HASHES, 32),
+        }
+        if not expected.issubset(merge_map):
+            return False
+
+        part = self.annotations.partition_mode or ""
+        if not (
+            part == ""
+            or part == "global_offset"
+            or part.startswith("scalar_u32:")
+            or part.startswith("global_offset+scalar_u32:")
+        ):
+            return False
+
+        return True
+
     def _ensure_output_buffers(self, max_results: int) -> None:
         if self.bridge is None:
             raise RuntimeError("VirtualASIC scanner is not initialized")
 
         if (
-            self._out_capacity == max_results
+            self._out_capacity >= max_results
             and self._out_nonces_buf
             and self._out_hashes_buf
             and self._out_count_buf
@@ -500,7 +671,48 @@ class VirtualAsicSha256dScanner:
 
         self._out_capacity = max_results
 
-    def scan(
+    def _filter_hits_for_range(
+        self,
+        hits: list[CandidateShare],
+        start_nonce: int,
+        end_nonce: int,
+        max_results: int,
+    ) -> list[CandidateShare]:
+        out: list[CandidateShare] = []
+        for share in hits:
+            nonce = int(getattr(share, "nonce", 0)) & 0xFFFFFFFF
+            if start_nonce <= nonce < end_nonce:
+                out.append(share)
+                if len(out) >= max_results:
+                    break
+        return out
+
+    def _hits_sorted(self, hits: list[CandidateShare]) -> list[CandidateShare]:
+        return sorted(hits, key=lambda s: int(getattr(s, "nonce", 0)) & 0xFFFFFFFF)
+
+    def _select_launch_count(self, requested_count: int) -> int:
+        launch_count = max(1, int(requested_count))
+
+        if self._is_hybrid_candidate_merge_kernel() and launch_count < self._hybrid_min_launch:
+            launch_count = self._hybrid_min_launch
+
+        launch_count = _align_up(launch_count, self._hybrid_align)
+        launch_count = min(launch_count, 0x100000000)
+        return max(1, int(launch_count))
+
+    def _select_launch_max_results(self, requested_count: int, launch_count: int, max_results: int) -> int:
+        requested_count = max(1, int(requested_count))
+        launch_count = max(1, int(launch_count))
+        base = max(1, int(max_results))
+
+        if launch_count <= requested_count:
+            return base
+
+        ratio = int(math.ceil(float(launch_count) / float(requested_count)))
+        scaled = max(base, base * ratio)
+        return min(self._hybrid_max_results_cap, scaled)
+
+    def _run_kernel(
         self,
         work: PreparedWork,
         start_nonce: int,
@@ -509,16 +721,6 @@ class VirtualAsicSha256dScanner:
     ) -> list[CandidateShare]:
         if self.bridge is None:
             raise RuntimeError("VirtualASIC scanner is not initialized")
-
-        if len(work.header_prefix76) != 76:
-            raise ValueError("PreparedWork.header_prefix76 must be 76 bytes")
-        if len(work.share_target_bytes_be) != 32:
-            raise ValueError("PreparedWork.share_target_bytes_be must be 32 bytes")
-
-        count = max(0, int(count))
-        max_results = max(1, int(max_results))
-        if count <= 0:
-            return []
 
         self._ensure_output_buffers(max_results)
 
@@ -551,4 +753,74 @@ class VirtualAsicSha256dScanner:
                     header_hash_hex=hash_be,
                 )
             )
-        return rows
+        return self._hits_sorted(rows)
+
+    def scan(
+        self,
+        work: PreparedWork,
+        start_nonce: int,
+        count: int,
+        max_results: int,
+    ) -> list[CandidateShare]:
+        if self.bridge is None:
+            raise RuntimeError("VirtualASIC scanner is not initialized")
+
+        if len(work.header_prefix76) != 76:
+            raise ValueError("PreparedWork.header_prefix76 must be 76 bytes")
+        if len(work.share_target_bytes_be) != 32:
+            raise ValueError("PreparedWork.share_target_bytes_be must be 32 bytes")
+
+        count = max(0, int(count))
+        max_results = max(1, int(max_results))
+        if count <= 0:
+            return []
+
+        work_key = self._work_key(work)
+        req_start = int(start_nonce) & 0xFFFFFFFF
+        req_end = req_start + count
+
+        if self._cache_work_key != work_key:
+            self._clear_cache()
+
+        results: list[CandidateShare] = []
+
+        if (
+            self._cache_work_key == work_key
+            and self._cache_range_start <= req_start < self._cache_range_end
+        ):
+            overlap_end = min(req_end, self._cache_range_end)
+            cached = self._filter_hits_for_range(self._cache_hits, req_start, overlap_end, max_results)
+            results.extend(cached)
+
+            if overlap_end >= req_end or len(results) >= max_results:
+                return results[:max_results]
+
+            req_start = overlap_end
+
+        available_space = 0x100000000 - req_start
+        if available_space <= 0:
+            return results[:max_results]
+
+        launch_count = self._select_launch_count(req_end - req_start)
+        launch_count = min(launch_count, available_space)
+
+        launch_max_results = self._select_launch_max_results(req_end - req_start, launch_count, max_results)
+        launch_max_results = max(launch_max_results, max_results)
+
+
+        launched_hits = self._run_kernel(
+            work=work,
+            start_nonce=req_start,
+            count=launch_count,
+            max_results=launch_max_results,
+        )
+
+        self._cache_work_key = work_key
+        self._cache_range_start = req_start
+        self._cache_range_end = req_start + launch_count
+        self._cache_hits = launched_hits
+
+        fresh = self._filter_hits_for_range(self._cache_hits, req_start, req_end, max_results - len(results))
+        results.extend(fresh)
+
+        return results[:max_results]
