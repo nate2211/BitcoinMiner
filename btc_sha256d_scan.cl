@@ -6,6 +6,18 @@
 
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
 
+#ifndef VASIC_CPU_LANE
+#define VASIC_CPU_LANE 0
+#endif
+
+#ifndef VASIC_ENABLE_DUAL_LANE
+#define VASIC_ENABLE_DUAL_LANE 1
+#endif
+
+#ifndef VASIC_USE_LOCAL_STAGING
+#define VASIC_USE_LOCAL_STAGING 1
+#endif
+
 __constant uint K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
     0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
@@ -109,7 +121,11 @@ inline void sha256_compress_16w(__private uint state[8], __private uint w[16]) {
 
 inline int btc_hash_meets_target_from_state(
     __private const uint s2[8],
+#if VASIC_USE_LOCAL_STAGING
     __local const uint* target_be_words
+#else
+    __private const uint* target_be_words
+#endif
 ) {
     uint hv;
 
@@ -125,6 +141,14 @@ inline int btc_hash_meets_target_from_state(
     return 1;
 }
 
+inline uint vasic_partitioned_nonce(uint gid, uint start_nonce) {
+#if VASIC_ENABLE_DUAL_LANE
+    return start_nonce + gid;
+#else
+    return start_nonce + gid;
+#endif
+}
+
 __kernel void btc_sha256d_scan(
     __global const uchar* header_prefix76,
     __global const uchar* target32_be,
@@ -137,13 +161,23 @@ __kernel void btc_sha256d_scan(
     const uint gid = (uint)get_global_id(0);
     const uint lid = (uint)get_local_id(0);
 
+#if VASIC_USE_LOCAL_STAGING
     __local uint l_midstate[8];
     __local uint l_tail0;
     __local uint l_tail1;
     __local uint l_tail2;
     __local uint l_target[8];
+#else
+    uint l_midstate[8];
+    uint l_tail0;
+    uint l_tail1;
+    uint l_tail2;
+    uint l_target[8];
+#endif
 
+#if VASIC_USE_LOCAL_STAGING
     if (lid == 0u) {
+#endif
         uint s[8];
         uint w[16];
 
@@ -168,11 +202,13 @@ __kernel void btc_sha256d_scan(
         for (uint i = 0u; i < 8u; ++i) {
             l_target[i] = read_be32_global(target32_be + (i * 4u));
         }
+#if VASIC_USE_LOCAL_STAGING
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
-    const uint nonce = start_nonce + gid;
+    const uint nonce = vasic_partitioned_nonce(gid, start_nonce);
 
     uint s1[8];
     uint w1[16];

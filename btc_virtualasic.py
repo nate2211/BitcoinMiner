@@ -92,6 +92,10 @@ def _align_up(value: int, align: int) -> int:
     return ((value + align - 1) // align) * align
 
 
+def _u32(value: int) -> int:
+    return int(value) & 0xFFFFFFFF
+
+
 @dataclass
 class VirtualAsicKernelAnnotations:
     candidate_merge_mode: bool = False
@@ -113,79 +117,135 @@ class VirtualAsicKernelAnnotations:
         )
 
 
-def _parse_kernel_annotations(kernel_path: str) -> VirtualAsicKernelAnnotations:
+def _parse_kernel_annotations_from_text(text: str) -> VirtualAsicKernelAnnotations:
     meta = VirtualAsicKernelAnnotations()
 
     try:
-        with open(kernel_path, "r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if "@vasic_" not in line:
-                    continue
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if "@vasic_" not in line:
+                continue
 
-                pos = line.find("@vasic_")
-                cmd = line[pos + len("@vasic_"):].strip()
+            pos = line.find("@vasic_")
+            cmd = line[pos + len("@vasic_"):].strip()
 
-                if cmd.startswith("mode"):
-                    value = cmd[len("mode"):].strip()
-                    if value == "candidate_merge":
-                        meta.candidate_merge_mode = True
+            if cmd.startswith("mode"):
+                value = cmd[len("mode"):].strip()
+                if value == "candidate_merge":
+                    meta.candidate_merge_mode = True
 
-                elif cmd.startswith("count_arg"):
-                    value = cmd[len("count_arg"):].strip()
+            elif cmd.startswith("count_arg"):
+                value = cmd[len("count_arg"):].strip()
+                try:
+                    meta.count_arg_index = int(value, 10)
+                except Exception:
+                    pass
+
+            elif cmd.startswith("merge_buffer"):
+                value = cmd[len("merge_buffer"):].strip()
+                if ":" in value:
+                    left, right = value.split(":", 1)
                     try:
-                        meta.count_arg_index = int(value, 10)
+                        meta.merge_buffers.append((int(left.strip(), 10), int(right.strip(), 10)))
                     except Exception:
                         pass
 
-                elif cmd.startswith("merge_buffer"):
-                    value = cmd[len("merge_buffer"):].strip()
-                    if ":" in value:
-                        left, right = value.split(":", 1)
-                        try:
-                            meta.merge_buffers.append((int(left.strip(), 10), int(right.strip(), 10)))
-                        except Exception:
-                            pass
-
-                elif cmd.startswith("partition"):
-                    value = cmd[len("partition"):].strip()
-                    meta.partition_mode = value
-                    if value.startswith("scalar_u32:"):
-                        try:
-                            meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
-                        except Exception:
-                            pass
-                    elif value.startswith("global_offset+scalar_u32:"):
-                        try:
-                            meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
-                        except Exception:
-                            pass
+            elif cmd.startswith("partition"):
+                value = cmd[len("partition"):].strip()
+                meta.partition_mode = value
+                if value.startswith("scalar_u32:"):
+                    try:
+                        meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
+                    except Exception:
+                        pass
+                elif value.startswith("global_offset+scalar_u32:"):
+                    try:
+                        meta.partition_scalar_arg_index = int(value.split(":", 1)[1].strip())
+                    except Exception:
+                        pass
     except Exception:
         pass
 
     return meta
 
 
+def _ensure_metadata_block(
+    source: str,
+    *,
+    arg_out_nonces: int,
+    arg_out_hashes: int,
+    arg_out_count: int,
+    arg_start_nonce: int,
+) -> str:
+    lines = source.splitlines()
+
+    has_mode = any("@vasic_mode" in line for line in lines)
+    has_count = any("@vasic_count_arg" in line for line in lines)
+    has_merge_nonce = any(f"@vasic_merge_buffer {arg_out_nonces}:4" in line for line in lines)
+    has_merge_hash = any(f"@vasic_merge_buffer {arg_out_hashes}:32" in line for line in lines)
+    has_partition = any("@vasic_partition" in line for line in lines)
+
+    header: list[str] = []
+    if not has_mode:
+        header.append("// @vasic_mode candidate_merge")
+    if not has_count:
+        header.append(f"// @vasic_count_arg {arg_out_count}")
+    if not has_merge_nonce:
+        header.append(f"// @vasic_merge_buffer {arg_out_nonces}:4")
+    if not has_merge_hash:
+        header.append(f"// @vasic_merge_buffer {arg_out_hashes}:32")
+    if not has_partition:
+        header.append(f"// @vasic_partition scalar_u32:{arg_start_nonce}")
+
+    if not header:
+        return source
+
+    return "\n".join(header) + "\n" + source
+
+
+def _build_kernel_source_with_cpu_lane(
+    source: str,
+    *,
+    enable_cpu_lane: bool,
+    arg_out_nonces: int,
+    arg_out_hashes: int,
+    arg_out_count: int,
+    arg_start_nonce: int,
+) -> str:
+    patched = source
+
+    prologue = [
+        "/* VirtualASIC injected prologue */",
+        "#ifndef VASIC_CPU_LANE",
+        f"#define VASIC_CPU_LANE {1 if enable_cpu_lane else 0}",
+        "#endif",
+        "#ifndef VASIC_ENABLE_DUAL_LANE",
+        f"#define VASIC_ENABLE_DUAL_LANE {1 if enable_cpu_lane else 0}",
+        "#endif",
+        "#ifndef VASIC_BITCOIN_KERNEL",
+        "#define VASIC_BITCOIN_KERNEL 1",
+        "#endif",
+        "",
+    ]
+
+    patched = "\n".join(prologue) + patched
+    patched = _ensure_metadata_block(
+        patched,
+        arg_out_nonces=arg_out_nonces,
+        arg_out_hashes=arg_out_hashes,
+        arg_out_count=arg_out_count,
+        arg_start_nonce=arg_start_nonce,
+    )
+    return patched
+
+
 class BitcoinVirtualAsicBridge:
     """
-    Required VirtualASIC DLL exports:
+    Uses the DLL surface already exposed by VirtualASIC.
 
-        vasic_create_ex(uint32_t core_count) -> void*
-        vasic_destroy(void*)
-        vasic_copy_last_error(void*, char*, uint32_t) -> int
-
-        vasic_create_buffer(void*, uint32_t size_bytes) -> uint32_t
-        vasic_release_buffer(void*, uint32_t buffer_id) -> int
-        vasic_write_buffer(void*, uint32_t buffer_id, uint32_t offset, const void* src, uint32_t size) -> int
-        vasic_read_buffer(void*, uint32_t buffer_id, uint32_t offset, void* dst, uint32_t size) -> int
-
-        vasic_load_kernel_file(void*, const char* kernel_name, const char* file_path) -> uint32_t
-        vasic_release_kernel(void*, uint32_t kernel_id) -> int
-
-        vasic_set_kernel_arg_buffer(void*, uint32_t kernel_id, uint32_t arg_index, uint32_t buffer_id) -> int
-        vasic_set_kernel_arg_u32(void*, uint32_t kernel_id, uint32_t arg_index, uint32_t value) -> int
-
-        vasic_enqueue_ndrange(void*, uint32_t kernel_id, uint32_t global_size) -> int
+    Important detail:
+    this version prefers vasic_load_kernel_source so we can inject source-level
+    compile macros and metadata without changing the DLL itself.
     """
 
     def __init__(
@@ -194,6 +254,7 @@ class BitcoinVirtualAsicBridge:
         kernel_path: str,
         kernel_name: str,
         core_count: int,
+        enable_cpu_lane: bool,
         on_log: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.on_log = on_log or (lambda msg: None)
@@ -202,6 +263,7 @@ class BitcoinVirtualAsicBridge:
         self.kernel_path = ""
         self.kernel_name = (kernel_name or "").strip()
         self.core_count = max(1, int(core_count))
+        self.enable_cpu_lane = bool(enable_cpu_lane)
 
         self.lib = None
         self.engine = None
@@ -210,6 +272,9 @@ class BitcoinVirtualAsicBridge:
         self.load_error = ""
         self._dll_dir_handles: list[object] = []
         self._call_lock = threading.Lock()
+        self._kernel_source_text = ""
+        self._kernel_source_patched = ""
+        self.annotations = VirtualAsicKernelAnnotations()
 
         try:
             self.dll_path = _resolve_existing_path(dll_path, "VirtualASIC.dll")
@@ -257,6 +322,11 @@ class BitcoinVirtualAsicBridge:
             self.lib.vasic_load_kernel_file.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
             self.lib.vasic_load_kernel_file.restype = ctypes.c_uint32
 
+            self._has_load_source = hasattr(self.lib, "vasic_load_kernel_source")
+            if self._has_load_source:
+                self.lib.vasic_load_kernel_source.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+                self.lib.vasic_load_kernel_source.restype = ctypes.c_uint32
+
             self.lib.vasic_release_kernel.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             self.lib.vasic_release_kernel.restype = ctypes.c_int
 
@@ -281,6 +351,10 @@ class BitcoinVirtualAsicBridge:
 
             self.available = True
             self.on_log(f"[virtualasic] loaded {self.dll_path}")
+            self.on_log(
+                f"[virtualasic] kernel loading mode="
+                f"{'source-patched' if self._has_load_source else 'file-only'}"
+            )
         except Exception as exc:
             self.available = False
             self.load_error = str(exc)
@@ -313,6 +387,10 @@ class BitcoinVirtualAsicBridge:
             except Exception:
                 pass
 
+    def _read_kernel_source(self) -> str:
+        with open(self.kernel_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
     def initialize(self) -> None:
         if not self.available or self.lib is None:
             raise RuntimeError("VirtualASIC DLL is not available")
@@ -323,19 +401,48 @@ class BitcoinVirtualAsicBridge:
             raise RuntimeError("vasic_create_ex failed")
 
         kernel_name_b = self.kernel_name.encode("utf-8") if self.kernel_name else None
-        kernel_path_b = self.kernel_path.encode("utf-8")
 
-        with self._call_lock:
-            self.kernel_id = int(self.lib.vasic_load_kernel_file(self.engine, kernel_name_b, kernel_path_b))
-        if not self.kernel_id:
-            err = self.last_error()
-            self.close()
-            raise RuntimeError(f"vasic_load_kernel_file failed: {err}")
+        self._kernel_source_text = self._read_kernel_source()
+        self._kernel_source_patched = _build_kernel_source_with_cpu_lane(
+            self._kernel_source_text,
+            enable_cpu_lane=self.enable_cpu_lane,
+            arg_out_nonces=2,
+            arg_out_hashes=3,
+            arg_out_count=4,
+            arg_start_nonce=5,
+        )
+        self.annotations = _parse_kernel_annotations_from_text(self._kernel_source_patched)
+
+        if self._has_load_source:
+            kernel_src_b = self._kernel_source_patched.encode("utf-8")
+            with self._call_lock:
+                self.kernel_id = int(self.lib.vasic_load_kernel_source(self.engine, kernel_name_b, kernel_src_b))
+            if not self.kernel_id:
+                err = self.last_error()
+                self.close()
+                raise RuntimeError(f"vasic_load_kernel_source failed: {err}")
+            self.on_log(
+                f"[virtualasic] loaded patched kernel source cpu_lane="
+                f"{'on' if self.enable_cpu_lane else 'off'}"
+            )
+        else:
+            kernel_path_b = self.kernel_path.encode("utf-8")
+            with self._call_lock:
+                self.kernel_id = int(self.lib.vasic_load_kernel_file(self.engine, kernel_name_b, kernel_path_b))
+            if not self.kernel_id:
+                err = self.last_error()
+                self.close()
+                raise RuntimeError(f"vasic_load_kernel_file failed: {err}")
+            self.on_log(
+                "[virtualasic] DLL has no vasic_load_kernel_source export; "
+                "fell back to file load"
+            )
 
         self.on_log(
             f"[virtualasic] engine created cores={self.core_count} "
             f"kernel={self.kernel_path} kernel_id={self.kernel_id}"
         )
+        self.on_log(f"[virtualasic] kernel annotations {self.annotations.summary()}")
 
     def close(self) -> None:
         try:
@@ -394,27 +501,25 @@ class BitcoinVirtualAsicBridge:
             return
         with self._call_lock:
             ok = self.lib.vasic_release_buffer(self.engine, ctypes.c_uint32(int(buffer_id)))
-        self._check(
-            ok,
-            f"vasic_release_buffer(buffer_id={buffer_id})",
-        )
+        self._check(ok, f"vasic_release_buffer(buffer_id={buffer_id})")
 
     def write_buffer(self, buffer_id: int, data: bytes, offset: int = 0) -> None:
         if self.lib is None or not self.engine:
             raise RuntimeError("VirtualASIC engine is not initialized")
 
-        src = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        payload = bytes(data or b"")
+        src = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
         with self._call_lock:
             ok = self.lib.vasic_write_buffer(
                 self.engine,
                 ctypes.c_uint32(int(buffer_id)),
                 ctypes.c_uint32(int(offset)),
                 src,
-                ctypes.c_uint32(len(data)),
+                ctypes.c_uint32(len(payload)),
             )
         self._check(
             ok,
-            f"vasic_write_buffer(buffer_id={buffer_id}, size={len(data)}, offset={offset})",
+            f"vasic_write_buffer(buffer_id={buffer_id}, size={len(payload)}, offset={offset})",
         )
 
     def read_buffer(self, buffer_id: int, size_bytes: int, offset: int = 0) -> bytes:
@@ -461,11 +566,11 @@ class BitcoinVirtualAsicBridge:
                 self.engine,
                 ctypes.c_uint32(self.kernel_id),
                 ctypes.c_uint32(int(arg_index)),
-                ctypes.c_uint32(int(value) & 0xFFFFFFFF),
+                ctypes.c_uint32(_u32(value)),
             )
         self._check(
             ok,
-            f"vasic_set_kernel_arg_u32(arg_index={arg_index}, value={int(value) & 0xFFFFFFFF})",
+            f"vasic_set_kernel_arg_u32(arg_index={arg_index}, value={_u32(value)})",
         )
 
     def enqueue(self, global_size: int) -> None:
@@ -478,28 +583,20 @@ class BitcoinVirtualAsicBridge:
                 ctypes.c_uint32(self.kernel_id),
                 ctypes.c_uint32(int(global_size)),
             )
-        self._check(
-            ok,
-            f"vasic_enqueue_ndrange(global_size={global_size})",
-        )
+        self._check(ok, f"vasic_enqueue_ndrange(global_size={global_size})")
 
 
 class VirtualAsicSha256dScanner:
     """
     Expected kernel arg contract for btc_sha256d_scan.cl:
 
-        arg 0: buffer prefix76       (76 bytes)
-        arg 1: buffer target32_be    (32 bytes)
-        arg 2: buffer out_nonces     (max_results * 4 bytes, little-endian u32s)
-        arg 3: buffer out_hashes_be  (max_results * 32 bytes)
-        arg 4: buffer out_count      (4 bytes, little-endian u32)
+        arg 0: buffer prefix76
+        arg 1: buffer target32_be
+        arg 2: buffer out_nonces
+        arg 3: buffer out_hashes_be
+        arg 4: buffer out_count
         arg 5: u32    start_nonce
         arg 6: u32    max_results
-
-    This rewrite activates CPU-lane-friendly behavior without changing the DLL by:
-      - reading kernel annotations
-      - using a larger launch window for candidate_merge kernels
-      - caching the overscanned nonce range so later worker calls do not overlap
     """
 
     ARG_PREFIX76 = 0
@@ -540,15 +637,14 @@ class VirtualAsicSha256dScanner:
             kernel_path=self.config.virtualasic_kernel_path,
             kernel_name=self.config.virtualasic_kernel_name,
             core_count=self.config.virtualasic_core_count,
+            enable_cpu_lane=bool(getattr(self.config, "virtualasic_force_cpu_lane", True)),
             on_log=self.on_log,
         )
         if not self.bridge.available:
             raise RuntimeError("VirtualASIC DLL could not be loaded")
 
-        self.annotations = _parse_kernel_annotations(self.bridge.kernel_path)
-        self.on_log(f"[virtualasic] kernel annotations {self.annotations.summary()}")
-
         self.bridge.initialize()
+        self.annotations = self.bridge.annotations
 
         self._prefix_buf = self.bridge.create_buffer(76)
         self._target_buf = self.bridge.create_buffer(32)
@@ -558,11 +654,11 @@ class VirtualAsicSha256dScanner:
 
         if self._is_hybrid_candidate_merge_kernel():
             self.on_log(
-                f"[virtualasic] cpu-lane assist enabled "
+                f"[virtualasic] cpu-lane metadata active "
                 f"min_launch={self._hybrid_min_launch} align={self._hybrid_align}"
             )
         else:
-            self.on_log("[virtualasic] cpu-lane assist disabled for this kernel")
+            self.on_log("[virtualasic] cpu-lane metadata not active; standard launch path")
 
         self.on_log(
             f"[virtualasic] ready kernel={self.config.virtualasic_kernel_name or '(file-defined)'} "
@@ -806,7 +902,6 @@ class VirtualAsicSha256dScanner:
 
         launch_max_results = self._select_launch_max_results(req_end - req_start, launch_count, max_results)
         launch_max_results = max(launch_max_results, max_results)
-
 
         launched_hits = self._run_kernel(
             work=work,
